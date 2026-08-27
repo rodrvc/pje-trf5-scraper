@@ -1,36 +1,36 @@
 ---
 id: ISSUE-10
-titulo: Suite de tests con fixtures
-estado: todo
+title: Test suite with fixtures
+status: todo
 ---
 
-## Objetivo
+## Goal
 
-"Manejo de errores 429" es criterio explícito de evaluación, y se decidió **no
-demostrarlo contra el servidor real** de un tribunal. Por lo tanto **los tests
-son la evidencia**, no un apéndice.
+"Handling 429 errors" is an explicit grading criterion, and the decision was
+**not to demonstrate it against the live server** of a real court. The tests are
+therefore the evidence, not an afterthought.
 
-## Alcance
+## Scope
 
-- Tests de la lógica de retry/backoff con mock HTTP (`nock`): 429 con y sin
-  `Retry-After`, 503, errores de red, agotamiento de intentos
-- Tests de los parsers como **funciones puras** `(html: string) => T`,
-  sin red de por medio
-- **Fixtures HTML reales** en `test/fixtures/`, capturadas del sitio:
-  - resultados con tope (30 + aviso)
-  - resultados sin tope
-  - panel de rechazo del servidor
-  - detalle con paginación interna
-  - respuesta HTML donde se esperaba un PDF (sesión caída)
-  - proceso en segredo de justiça, si se encuentra uno
+- Retry/backoff tests with a mock HTTP server (`nock`): 429 with and without
+  `Retry-After`, 503, network errors, attempt exhaustion
+- Parser tests as **pure functions** `(html: string) => T`, with no network
+- **Real HTML fixtures** in `test/fixtures/`, captured from the site:
+  - capped results (30 + warning)
+  - uncapped results
+  - server rejection panel
+  - detail view with internal pagination
+  - an HTML response where a PDF was expected (dropped session)
+  - a case under segredo de justiça, if one can be found
 
-Las fixtures valen doble: prueban los parsers sin red y documentan el sitio.
+The fixtures pay off twice: they test the parsers without a network and they
+document the site.
 
-## Criterio de aceptación
+## Acceptance
 
-- `npm test` pasa sin conexión a internet.
-- El comportamiento ante 429 queda demostrado de forma reproducible.
+- `npm test` passes with no internet connection.
+- Behaviour under 429 is demonstrated reproducibly.
 
-## Resolución
+## Resolution
 
-_(pendiente)_
+_(pending)_

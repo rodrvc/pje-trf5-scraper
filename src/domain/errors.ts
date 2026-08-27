@@ -1,10 +1,10 @@
 /**
- * Errores del scraper.
+ * Scraper errors.
  *
- * Están tipados porque cada uno exige una reacción distinta: el rate limiting
- * se reintenta con espera, la sesión caída se reestablece, y una consulta
- * rechazada no tiene sentido reintentarla tal cual. Distinguirlos por clase
- * evita tener que inspeccionar el texto del mensaje para decidir qué hacer.
+ * These are typed because each one calls for a different reaction: rate limiting
+ * is retried after a wait, an expired session is re-established, and a rejected
+ * query is pointless to retry unchanged. Distinguishing them by class avoids
+ * inspecting error messages to decide what to do.
  */
 
 export abstract class ScraperError extends Error {
@@ -15,53 +15,54 @@ export abstract class ScraperError extends Error {
 }
 
 /**
- * El servidor respondió 429. Se reintenta con backoff exponencial.
+ * The server answered 429. Retried with exponential backoff.
  *
- * `retryAfterSegundos` viene de la cabecera `Retry-After` cuando el servidor la
- * envía; en ese caso tiene prioridad sobre el backoff calculado.
+ * `retryAfterSeconds` comes from the `Retry-After` header when the server sends
+ * one, in which case it takes precedence over the computed backoff.
  */
 export class RateLimitError extends ScraperError {
   constructor(
     message: string,
-    readonly retryAfterSegundos?: number,
+    readonly retryAfterSeconds?: number,
   ) {
     super(message);
   }
 }
 
 /**
- * La sesión JSF caducó.
+ * The JSF session expired.
  *
- * Llega como 200 con el HTML de la home, no como un error HTTP, así que hay que
- * detectarla por contenido. Se resuelve reestableciendo la sesión y reintentando
- * la operación.
+ * It arrives as a 200 carrying the home page rather than an HTTP error, so it
+ * has to be detected by content. Recovering means re-establishing the session
+ * and retrying the operation.
  */
 export class SessionExpiredError extends ScraperError {}
 
 /**
- * El servidor validó la consulta y la rechazó (por ejemplo, exige al menos dos
- * nombres al buscar por parte). Reintentarla sin cambiarla daría lo mismo.
+ * The server validated the query and rejected it - searching by party name
+ * requires at least two names, for instance. Retrying it unchanged would give
+ * the same outcome.
  */
 export class RejectedQueryError extends ScraperError {
   constructor(
     message: string,
-    readonly mensajeServidor: string,
+    readonly serverMessage: string,
   ) {
     super(message);
   }
 }
 
-/** El HTML no tenía la forma esperada. Suele indicar que el sitio cambió. */
+/** The markup did not have the expected shape. Usually means the site changed. */
 export class ParseError extends ScraperError {
   constructor(
     message: string,
-    readonly contexto?: string,
+    readonly context?: string,
   ) {
     super(message);
   }
 }
 
-/** La descarga no devolvió un PDF válido. */
+/** The download did not return a valid PDF. */
 export class DownloadError extends ScraperError {
   constructor(
     message: string,
@@ -72,9 +73,9 @@ export class DownloadError extends ScraperError {
 }
 
 /**
- * Se acumularon demasiados 429 seguidos.
+ * Too many consecutive 429s piled up.
  *
- * Corta la ejecución en vez de seguir insistiendo contra un servidor que está
- * pidiendo explícitamente que se pare.
+ * Stops the run instead of hammering a server that is explicitly asking us to
+ * back off.
  */
 export class CircuitBreakerError extends ScraperError {}

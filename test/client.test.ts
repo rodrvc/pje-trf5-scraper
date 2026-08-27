@@ -1,10 +1,10 @@
 /**
- * Tests del cliente HTTP contra un servidor simulado.
+ * HTTP client tests against a simulated server.
  *
- * El manejo de 429 es criterio de evaluación del desafío, y se decidió no
- * demostrarlo provocándolo contra el sitio real de un tribunal. Estos tests son
- * esa demostración: reproducen el rate limiting de forma controlada y
- * reproducible, sin enviar una sola petición a la red.
+ * Handling 429 is an explicit grading criterion, and the decision was not to
+ * demonstrate it by provoking one against a real court's site. These tests are
+ * that demonstration: they reproduce rate limiting in a controlled, repeatable
+ * way without sending a single request over the network.
  */
 
 import nock from 'nock';
@@ -13,10 +13,10 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { HttpClient } from '../src/http/client.js';
 import { CircuitBreakerError, RateLimitError } from '../src/domain/errors.js';
 
-const BASE = 'https://ejemplo.test';
+const BASE = 'https://example.test';
 
-/** Cliente sin esperas reales, para que los tests no tarden. */
-function clienteRapido(overrides: ConstructorParameters<typeof HttpClient>[0] = {}) {
+/** Client with no real waits, to keep the tests fast. */
+function fastClient(overrides: ConstructorParameters<typeof HttpClient>[0] = {}) {
   return new HttpClient({
     delayMs: 0,
     backoff: { baseMs: 1, maxMs: 5, jitter: 0 },
@@ -37,138 +37,138 @@ afterAll(() => {
 });
 
 describe('encoding', () => {
-  it('decodifica ISO-8859-1, que es lo que responde el sitio', async () => {
-    // "APELAÇÃO CÍVEL" codificado en latin-1.
+  it('decodes ISO-8859-1, which is what page loads return', async () => {
+    // "APELAÇÃO CÍVEL" encoded as latin-1.
     const latin1 = Buffer.from('APELAÇÃO CÍVEL', 'latin1');
-    nock(BASE).get('/pagina').reply(200, latin1, { 'Content-Type': 'text/html;charset=ISO-8859-1' });
+    nock(BASE).get('/page').reply(200, latin1, { 'Content-Type': 'text/html;charset=ISO-8859-1' });
 
-    const { html } = await clienteRapido().get(`${BASE}/pagina`);
+    const { html } = await fastClient().get(`${BASE}/page`);
 
     expect(html).toBe('APELAÇÃO CÍVEL');
   });
 
-  it('no produce la corrupción típica de leer latin-1 como UTF-8', async () => {
+  it('avoids the corruption typical of reading latin-1 as UTF-8', async () => {
     const latin1 = Buffer.from('Última movimentação', 'latin1');
-    nock(BASE).get('/pagina').reply(200, latin1, { 'Content-Type': 'text/html;charset=ISO-8859-1' });
+    nock(BASE).get('/page').reply(200, latin1, { 'Content-Type': 'text/html;charset=ISO-8859-1' });
 
-    const { html } = await clienteRapido().get(`${BASE}/pagina`);
+    const { html } = await fastClient().get(`${BASE}/page`);
 
     expect(html).toBe('Última movimentação');
-    // Leerlo como UTF-8 daría "Ãltima movimentaÃ§Ã£o".
+    // Reading it as UTF-8 would give "Ãltima movimentaÃ§Ã£o".
     expect(html).not.toContain('Ã§');
     expect(html).not.toContain('Ã£');
   });
 
-  it('también decodifica UTF-8, que es lo que devuelven las respuestas AJAX', async () => {
-    // El sitio no es uniforme: las páginas completas vienen en latin-1, pero
-    // los POST responden en UTF-8. Ninguno declara charset en el cuerpo.
+  it('also decodes UTF-8, which is what AJAX responses return', async () => {
+    // The site is not uniform: full pages come as latin-1, but POSTs answer in
+    // UTF-8. Neither declares a charset in the body.
     const utf8 = Buffer.from('É necessário informar ao menos dois nomes', 'utf8');
     nock(BASE).post('/ajax').reply(200, utf8, { 'Content-Type': 'text/html' });
 
-    const { html } = await clienteRapido().post(`${BASE}/ajax`, new URLSearchParams());
+    const { html } = await fastClient().post(`${BASE}/ajax`, new URLSearchParams());
 
     expect(html).toBe('É necessário informar ao menos dois nomes');
   });
 
-  it('distingue los dos encodings por los bytes, sin fiarse de la cabecera', async () => {
-    const mismoTexto = 'Ação';
+  it('tells both encodings apart from the bytes, not the header', async () => {
+    const sameText = 'Ação';
     nock(BASE)
       .get('/latin')
-      .reply(200, Buffer.from(mismoTexto, 'latin1'), { 'Content-Type': 'text/html' })
+      .reply(200, Buffer.from(sameText, 'latin1'), { 'Content-Type': 'text/html' })
       .get('/utf')
-      .reply(200, Buffer.from(mismoTexto, 'utf8'), { 'Content-Type': 'text/html' });
+      .reply(200, Buffer.from(sameText, 'utf8'), { 'Content-Type': 'text/html' });
 
-    const cliente = clienteRapido();
+    const client = fastClient();
 
-    expect((await cliente.get(`${BASE}/latin`)).html).toBe(mismoTexto);
-    expect((await cliente.get(`${BASE}/utf`)).html).toBe(mismoTexto);
+    expect((await client.get(`${BASE}/latin`)).html).toBe(sameText);
+    expect((await client.get(`${BASE}/utf`)).html).toBe(sameText);
   });
 });
 
-describe('reintentos ante 429', () => {
-  it('reintenta y termina devolviendo la respuesta buena', async () => {
+describe('retrying on 429', () => {
+  it('retries and eventually returns the good response', async () => {
     nock(BASE).get('/x').reply(429).get('/x').reply(429).get('/x').reply(200, 'ok');
 
-    const respuesta = await clienteRapido().get(`${BASE}/x`);
+    const response = await fastClient().get(`${BASE}/x`);
 
-    expect(respuesta.status).toBe(200);
-    expect(respuesta.html).toBe('ok');
+    expect(response.status).toBe(200);
+    expect(response.html).toBe('ok');
     expect(nock.isDone()).toBe(true);
   });
 
-  it('respeta el Retry-After que envía el servidor', async () => {
+  it('honours the Retry-After the server sends', async () => {
     nock(BASE).get('/x').reply(429, '', { 'Retry-After': '0' }).get('/x').reply(200, 'ok');
 
-    const esperas: number[] = [];
-    const cliente = clienteRapido({
-      alReintentar: ({ esperaMs }) => esperas.push(esperaMs),
+    const delays: number[] = [];
+    const client = fastClient({
+      onRetry: ({ delayMs }) => delays.push(delayMs),
     });
 
-    await cliente.get(`${BASE}/x`);
+    await client.get(`${BASE}/x`);
 
-    // Retry-After: 0 manda por encima del backoff calculado.
-    expect(esperas).toEqual([0]);
+    // Retry-After: 0 wins over the computed backoff.
+    expect(delays).toEqual([0]);
   });
 
-  it('avisa de cada reintento, para poder registrarlo', async () => {
+  it('reports each retry so it can be logged', async () => {
     nock(BASE).get('/x').reply(429).get('/x').reply(429).get('/x').reply(200, 'ok');
 
-    const intentos: number[] = [];
-    const cliente = clienteRapido({
-      alReintentar: ({ intento }) => intentos.push(intento),
+    const attempts: number[] = [];
+    const client = fastClient({
+      onRetry: ({ attempt }) => attempts.push(attempt),
     });
 
-    await cliente.get(`${BASE}/x`);
+    await client.get(`${BASE}/x`);
 
-    expect(intentos).toEqual([1, 2]);
+    expect(attempts).toEqual([1, 2]);
   });
 
-  it('se rinde con RateLimitError al agotar los reintentos', async () => {
+  it('gives up with RateLimitError once retries run out', async () => {
     nock(BASE).get('/x').times(3).reply(429, '', { 'Retry-After': '7' });
 
-    const cliente = clienteRapido({ maxReintentos: 2 });
+    const client = fastClient({ maxRetries: 2 });
 
-    await expect(cliente.get(`${BASE}/x`)).rejects.toThrow(RateLimitError);
+    await expect(client.get(`${BASE}/x`)).rejects.toThrow(RateLimitError);
   });
 
-  it('conserva el Retry-After en el error, para poder reintentar más tarde', async () => {
+  it('keeps Retry-After on the error, so it can be retried later', async () => {
     nock(BASE).get('/x').times(2).reply(429, '', { 'Retry-After': '42' });
 
-    const cliente = clienteRapido({ maxReintentos: 1 });
+    const client = fastClient({ maxRetries: 1 });
 
-    await expect(cliente.get(`${BASE}/x`)).rejects.toMatchObject({
-      retryAfterSegundos: 42,
+    await expect(client.get(`${BASE}/x`)).rejects.toMatchObject({
+      retryAfterSeconds: 42,
     });
   });
 
-  it('reintenta también los 5xx transitorios', async () => {
+  it('retries transient 5xx as well', async () => {
     nock(BASE).get('/x').reply(503).get('/x').reply(200, 'ok');
 
-    const respuesta = await clienteRapido().get(`${BASE}/x`);
+    const response = await fastClient().get(`${BASE}/x`);
 
-    expect(respuesta.status).toBe(200);
+    expect(response.status).toBe(200);
   });
 
-  it('no reintenta un 404: no es transitorio', async () => {
-    nock(BASE).get('/x').reply(404, 'no está');
+  it('does not retry a 404: it is not transient', async () => {
+    nock(BASE).get('/x').reply(404, 'not found');
 
-    const respuesta = await clienteRapido().get(`${BASE}/x`);
+    const response = await fastClient().get(`${BASE}/x`);
 
-    expect(respuesta.status).toBe(404);
-    expect(nock.isDone()).toBe(true); // una sola petición
+    expect(response.status).toBe(404);
+    expect(nock.isDone()).toBe(true); // a single request
   });
 });
 
 describe('circuit breaker', () => {
-  it('aborta cuando el servidor insiste en pedir que paremos', async () => {
+  it('aborts when the server keeps asking us to stop', async () => {
     nock(BASE).get('/x').times(10).reply(429);
 
-    const cliente = clienteRapido({ maxReintentos: 20, umbralCircuitBreaker: 3 });
+    const client = fastClient({ maxRetries: 20, circuitBreakerThreshold: 3 });
 
-    await expect(cliente.get(`${BASE}/x`)).rejects.toThrow(CircuitBreakerError);
+    await expect(client.get(`${BASE}/x`)).rejects.toThrow(CircuitBreakerError);
   });
 
-  it('vuelve a cero tras una respuesta buena', async () => {
+  it('resets after a good response', async () => {
     nock(BASE)
       .get('/a')
       .reply(429)
@@ -179,73 +179,73 @@ describe('circuit breaker', () => {
       .get('/b')
       .reply(200, 'ok');
 
-    const cliente = clienteRapido({ umbralCircuitBreaker: 2 });
+    const client = fastClient({ circuitBreakerThreshold: 2 });
 
-    // Dos 429 en total, pero no consecutivos: no debe saltar el breaker.
-    await expect(cliente.get(`${BASE}/a`)).resolves.toMatchObject({ status: 200 });
-    await expect(cliente.get(`${BASE}/b`)).resolves.toMatchObject({ status: 200 });
+    // Two 429s overall, but not consecutive: the breaker must not trip.
+    await expect(client.get(`${BASE}/a`)).resolves.toMatchObject({ status: 200 });
+    await expect(client.get(`${BASE}/b`)).resolves.toMatchObject({ status: 200 });
   });
 });
 
-describe('descargas binarias', () => {
-  it('devuelve los bytes sin decodificar y expone el content-type', async () => {
-    const pdf = Buffer.from('%PDF-1.4\nbinario\n');
+describe('binary downloads', () => {
+  it('returns undecoded bytes and exposes the content type', async () => {
+    const pdf = Buffer.from('%PDF-1.4\nbinary\n');
     nock(BASE).get('/doc').reply(200, pdf, { 'Content-Type': 'application/pdf' });
 
-    const respuesta = await clienteRapido().getBinario(`${BASE}/doc`);
+    const response = await fastClient().getBinary(`${BASE}/doc`);
 
-    expect(respuesta.contentType).toContain('application/pdf');
-    expect(respuesta.datos.subarray(0, 5).toString()).toBe('%PDF-');
+    expect(response.contentType).toContain('application/pdf');
+    expect(response.data.subarray(0, 5).toString()).toBe('%PDF-');
   });
 
-  it('sigue el redirect, que es como se sirven los PDFs del PJe', async () => {
+  it('follows the redirect, which is how PJe serves its PDFs', async () => {
     nock(BASE)
-      .get('/documento?idBin=1')
+      .get('/document?idBin=1')
       .reply(302, '', { Location: `${BASE}/download.seam?cid=99` });
     nock(BASE)
       .get('/download.seam?cid=99')
       .reply(200, Buffer.from('%PDF-1.4'), { 'Content-Type': 'application/pdf' });
 
-    const respuesta = await clienteRapido().getBinario(`${BASE}/documento?idBin=1`);
+    const response = await fastClient().getBinary(`${BASE}/document?idBin=1`);
 
-    expect(respuesta.datos.toString()).toContain('%PDF');
+    expect(response.data.toString()).toContain('%PDF');
     expect(nock.isDone()).toBe(true);
   });
 });
 
-describe('ritmo entre peticiones', () => {
-  it('espacia las peticiones para no atropellar al servidor', async () => {
+describe('request pacing', () => {
+  it('spaces out requests so the server is not overrun', async () => {
     nock(BASE).get('/a').reply(200, 'a').get('/b').reply(200, 'b');
 
-    const cliente = new HttpClient({ delayMs: 50 });
-    const inicio = Date.now();
-    await cliente.get(`${BASE}/a`);
-    await cliente.get(`${BASE}/b`);
+    const client = new HttpClient({ delayMs: 50 });
+    const start = Date.now();
+    await client.get(`${BASE}/a`);
+    await client.get(`${BASE}/b`);
 
-    expect(Date.now() - inicio).toBeGreaterThanOrEqual(45);
+    expect(Date.now() - start).toBeGreaterThanOrEqual(45);
   });
 
-  it('serializa las peticiones concurrentes en vez de lanzarlas a la vez', async () => {
-    let enVuelo = 0;
-    let maximoSimultaneo = 0;
+  it('serializes concurrent requests instead of firing them at once', async () => {
+    let inFlight = 0;
+    let peakConcurrency = 0;
 
     nock(BASE)
       .get('/x')
       .times(3)
       .reply(() => {
-        enVuelo++;
-        maximoSimultaneo = Math.max(maximoSimultaneo, enVuelo);
-        enVuelo--;
+        inFlight++;
+        peakConcurrency = Math.max(peakConcurrency, inFlight);
+        inFlight--;
         return [200, 'ok'];
       });
 
-    const cliente = clienteRapido();
+    const client = fastClient();
     await Promise.all([
-      cliente.get(`${BASE}/x`),
-      cliente.get(`${BASE}/x`),
-      cliente.get(`${BASE}/x`),
+      client.get(`${BASE}/x`),
+      client.get(`${BASE}/x`),
+      client.get(`${BASE}/x`),
     ]);
 
-    expect(maximoSimultaneo).toBe(1);
+    expect(peakConcurrency).toBe(1);
   });
 });

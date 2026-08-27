@@ -1,82 +1,78 @@
 import { describe, expect, it } from 'vitest';
 
-import {
-  BACKOFF_POR_DEFECTO,
-  calcularEspera,
-  parseRetryAfter,
-} from '../src/http/backoff.js';
+import { DEFAULT_BACKOFF, computeDelay, parseRetryAfter } from '../src/http/backoff.js';
 
-/** Fuente de aleatoriedad fija, para que las esperas sean deterministas. */
-const sinJitter = () => 0.5;
+/** Fixed randomness source, so delays are deterministic. */
+const noJitter = () => 0.5;
 
 describe('parseRetryAfter', () => {
-  it('entiende el formato en segundos', () => {
+  it('understands the seconds format', () => {
     expect(parseRetryAfter('120')).toBe(120_000);
     expect(parseRetryAfter('0')).toBe(0);
   });
 
-  it('entiende el formato de fecha HTTP', () => {
-    const ahora = Date.parse('Wed, 21 Oct 2026 07:28:00 GMT');
-    const dentroDeUnMinuto = 'Wed, 21 Oct 2026 07:29:00 GMT';
-    expect(parseRetryAfter(dentroDeUnMinuto, ahora)).toBe(60_000);
+  it('understands the HTTP date format', () => {
+    const now = Date.parse('Wed, 21 Oct 2026 07:28:00 GMT');
+    const inOneMinute = 'Wed, 21 Oct 2026 07:29:00 GMT';
+    expect(parseRetryAfter(inOneMinute, now)).toBe(60_000);
   });
 
-  it('nunca devuelve espera negativa si la fecha ya pasó', () => {
-    const ahora = Date.parse('Wed, 21 Oct 2026 07:28:00 GMT');
-    const pasado = 'Wed, 21 Oct 2026 07:00:00 GMT';
-    expect(parseRetryAfter(pasado, ahora)).toBe(0);
+  it('never returns a negative wait when the date has passed', () => {
+    const now = Date.parse('Wed, 21 Oct 2026 07:28:00 GMT');
+    const past = 'Wed, 21 Oct 2026 07:00:00 GMT';
+    expect(parseRetryAfter(past, now)).toBe(0);
   });
 
-  it('devuelve undefined cuando la cabecera falta o no se entiende', () => {
+  it('returns undefined when the header is missing or unparseable', () => {
     expect(parseRetryAfter(undefined)).toBeUndefined();
     expect(parseRetryAfter('')).toBeUndefined();
     expect(parseRetryAfter('   ')).toBeUndefined();
-    expect(parseRetryAfter('pronto')).toBeUndefined();
+    expect(parseRetryAfter('soon')).toBeUndefined();
   });
 });
 
-describe('calcularEspera', () => {
-  it('crece de forma exponencial con cada intento', () => {
-    const opciones = { baseMs: 1_000, maxMs: 60_000, jitter: 0 };
-    expect(calcularEspera(1, opciones, undefined, sinJitter)).toBe(1_000);
-    expect(calcularEspera(2, opciones, undefined, sinJitter)).toBe(2_000);
-    expect(calcularEspera(3, opciones, undefined, sinJitter)).toBe(4_000);
-    expect(calcularEspera(4, opciones, undefined, sinJitter)).toBe(8_000);
+describe('computeDelay', () => {
+  it('grows exponentially with each attempt', () => {
+    const options = { baseMs: 1_000, maxMs: 60_000, jitter: 0 };
+    expect(computeDelay(1, options, undefined, noJitter)).toBe(1_000);
+    expect(computeDelay(2, options, undefined, noJitter)).toBe(2_000);
+    expect(computeDelay(3, options, undefined, noJitter)).toBe(4_000);
+    expect(computeDelay(4, options, undefined, noJitter)).toBe(8_000);
   });
 
-  it('no supera el techo configurado', () => {
-    const opciones = { baseMs: 1_000, maxMs: 5_000, jitter: 0 };
-    expect(calcularEspera(10, opciones, undefined, sinJitter)).toBe(5_000);
+  it('never exceeds the configured ceiling', () => {
+    const options = { baseMs: 1_000, maxMs: 5_000, jitter: 0 };
+    expect(computeDelay(10, options, undefined, noJitter)).toBe(5_000);
   });
 
-  it('obedece al Retry-After del servidor por encima del cálculo propio', () => {
-    const opciones = { baseMs: 1_000, maxMs: 60_000, jitter: 0 };
-    // El exponencial daría 4000; el servidor pide 30s y manda el servidor.
-    expect(calcularEspera(3, opciones, 30_000, sinJitter)).toBe(30_000);
+  it('lets the server Retry-After win over our own calculation', () => {
+    const options = { baseMs: 1_000, maxMs: 60_000, jitter: 0 };
+    // Exponential would give 4000; the server asks for 30s and the server wins.
+    expect(computeDelay(3, options, 30_000, noJitter)).toBe(30_000);
   });
 
-  it('aplica el techo también al Retry-After, para no colgar la ejecución', () => {
-    const opciones = { baseMs: 1_000, maxMs: 10_000, jitter: 0 };
-    expect(calcularEspera(1, opciones, 3_600_000, sinJitter)).toBe(10_000);
+  it('applies the ceiling to Retry-After too, so the run cannot stall', () => {
+    const options = { baseMs: 1_000, maxMs: 10_000, jitter: 0 };
+    expect(computeDelay(1, options, 3_600_000, noJitter)).toBe(10_000);
   });
 
-  it('reparte las esperas con jitter para que los reintentos no se sincronicen', () => {
-    const opciones = { baseMs: 1_000, maxMs: 60_000, jitter: 0.3 };
-    const minimo = calcularEspera(1, opciones, undefined, () => 0);
-    const maximo = calcularEspera(1, opciones, undefined, () => 1);
+  it('spreads delays with jitter so retries do not sync up', () => {
+    const options = { baseMs: 1_000, maxMs: 60_000, jitter: 0.3 };
+    const lowest = computeDelay(1, options, undefined, () => 0);
+    const highest = computeDelay(1, options, undefined, () => 1);
 
-    expect(minimo).toBe(700); // 1000 - 30%
-    expect(maximo).toBe(1_300); // 1000 + 30%
-    expect(minimo).not.toBe(maximo);
+    expect(lowest).toBe(700); // 1000 - 30%
+    expect(highest).toBe(1_300); // 1000 + 30%
+    expect(lowest).not.toBe(highest);
   });
 
-  it('nunca devuelve una espera negativa', () => {
-    const opciones = { baseMs: 100, maxMs: 60_000, jitter: 2 };
-    expect(calcularEspera(1, opciones, undefined, () => 0)).toBeGreaterThanOrEqual(0);
+  it('never returns a negative delay', () => {
+    const options = { baseMs: 100, maxMs: 60_000, jitter: 2 };
+    expect(computeDelay(1, options, undefined, () => 0)).toBeGreaterThanOrEqual(0);
   });
 
-  it('trae valores por defecto razonables', () => {
-    expect(BACKOFF_POR_DEFECTO.baseMs).toBeGreaterThan(0);
-    expect(BACKOFF_POR_DEFECTO.maxMs).toBeGreaterThan(BACKOFF_POR_DEFECTO.baseMs);
+  it('ships sensible defaults', () => {
+    expect(DEFAULT_BACKOFF.baseMs).toBeGreaterThan(0);
+    expect(DEFAULT_BACKOFF.maxMs).toBeGreaterThan(DEFAULT_BACKOFF.baseMs);
   });
 });
