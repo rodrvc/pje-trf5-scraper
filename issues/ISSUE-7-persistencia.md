@@ -22,6 +22,12 @@ Resuelve el problema 10 de `PROBLEMAS.md`.
   como parte del manejo de 429
 - Idempotencia: no re-descargar un PDF ya presente y válido; deduplicar procesos
   por número CNJ
+- **Escritura atómica del estado**: temp + rename, igual que los PDFs. Mejor aún,
+  estado append-only (NDJSON de ventanas completadas) reconstruido al arrancar:
+  elimina la clase entera de bugs por corrupción a mitad de escritura
+- Los tokens `ca=` **sí se pueden persistir**: se verificó que no caducan con la
+  sesión (funcionan incluso sin cookie), así que al reanudar no hace falta repetir
+  la búsqueda para volver a entrar a un proceso ya listado
 
 ## Criterio de aceptación
 

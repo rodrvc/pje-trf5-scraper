@@ -19,3 +19,5 @@ Estado del tablero:
 | [ISSUE-6](ISSUE-6-pdfs.md) | Descarga de PDFs | todo |
 | [ISSUE-7](ISSUE-7-persistencia.md) | Persistencia y reanudación | todo |
 | [ISSUE-8](ISSUE-8-cli-readme.md) | CLI, logging y README | todo |
+| [ISSUE-9](ISSUE-9-orquestador.md) | Orquestador del recorrido | todo |
+| [ISSUE-10](ISSUE-10-tests.md) | Suite de tests con fixtures | todo |

@@ -34,10 +34,18 @@ Partes y movimientos vienen paginados dentro de la página con
 El ViewState del detalle es distinto al de la búsqueda y debe refrescarse
 en cada respuesta.
 
+## Procesos en segredo de justiça
+
+El PJe los marca y devuelve detalle parcial o denegado. **No es un error, es un
+estado válido del dominio.** Un parser que asuma que siempre hay partes y
+movimientos revienta. Modelarlo explícitamente (`sigiloso: true`, campos
+ausentes) y mencionarlo en el README.
+
 ## Criterio de aceptación
 
 - Un proceso con varias páginas de partes y movimientos se extrae completo,
   no solo su primera página.
+- Un proceso sigiloso se registra como tal, sin romper la ejecución.
 
 ## Resolución
 

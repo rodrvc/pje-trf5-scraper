@@ -85,6 +85,56 @@ Detalle para la implementación: la búsqueda por fecha es el mismo POST del
 problema 1, llenando `dataAutuacaoInicioInputDate` y `dataAutuacaoFimInputDate`
 en formato `dd/MM/yyyy`.
 
+### Corrección: un día NO siempre cabe en 30
+
+La primera versión de esta resolución asumía que un solo día siempre queda por
+debajo del tope. **Es falso.** Al sondear marzo de 2025 día por día:
+
+| Día        | Filas | ¿Tope? |
+|------------|-------|--------|
+| 03/03/2025 | 4     | no     |
+| 04/03/2025 | 7     | no     |
+| 05/03/2025 | 10    | no     |
+| 06/03/2025 | 16    | no     |
+| 07/03/2025 | 25    | no     |
+| 10/03/2025 | 23    | no     |
+| 11/03/2025 | **30**| **sí** |
+| 12/03/2025 | **30**| **sí** |
+| 13/03/2025 | **30**| **sí** |
+| 14/03/2025 | **30**| **sí** |
+| 17/03/2025 | 22    | no     |
+| 18/03/2025 | **30**| **sí** |
+| 19/03/2025 | **30**| **sí** |
+
+6 de 13 días saturan. Con solo el eje de fechas se perderían procesos en la
+mitad de los días.
+
+**Solución: una segunda dimensión de partición, la clase judicial.**
+
+El campo "Classe judicial" es un `RichFaces.Suggestion`. El texto libre no filtra:
+hay que mandar el **id interno** en `fPP:j_id189:sgbClasseJudicial_selection`.
+El catálogo completo (133 clases con sus ids) se obtiene con un POST al propio
+autocompletado, que devuelve todas las entradas.
+
+Verificado: el 11/03/2025 satura con 30, pero filtrando por clase 202
+(Agravo de Instrumento) devuelve **19 filas sin tope**.
+
+Entonces la subdivisión es en cascada: primero partir el rango de fechas; cuando
+un solo día siga saturando, subdividir ese día por clase judicial.
+
+### Condición de saturación
+
+En 14 sondeos, `filas == 30` siempre vino acompañado del aviso, y `< 30` nunca.
+Aun así conviene la condición defensiva **`filas >= 30 || hay aviso`**: si alguna
+vez el tope llegara sin aviso, la alternativa es perder procesos en silencio.
+
+### Vías descartadas
+
+Los campos "Processo" y "Processo referência" **no aceptan búsqueda parcial**: al
+pasarles `8100` (código de órgano de origen) devuelven exactamente los mismos
+resultados que sin filtro. Se ignoran en silencio; sirven solo para búsqueda
+exacta. No son utilizables para particionar.
+
 ---
 
 ## 6. El detalle del proceso pagina por dentro
@@ -114,6 +164,17 @@ paginador (`«« « 1 2 3 ... » »»`).
 
 Ojo: el ViewState de la página de detalle es distinto al de la búsqueda, y hay que
 refrescarlo con cada respuesta.
+
+### El token `ca=` no caduca con la sesión
+
+Comprobado en tres escenarios con el mismo token: la sesión que lo generó, una
+sesión nueva y limpia, y **sin enviar cookie alguna**. Los tres devuelven 200 con
+el detalle del mismo proceso.
+
+Es decir, `ca=` es un identificador estable del proceso, no un token de
+conversación como el `cid` de los PDFs (problema 7). **Se puede persistir para
+reanudar**: al retomar una ejecución no hace falta repetir la búsqueda para volver
+a entrar a un proceso ya listado.
 
 ---
 

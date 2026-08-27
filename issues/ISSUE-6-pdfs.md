@@ -22,7 +22,9 @@ se descargó un PDF real de 19 KB.
 
       pdfs/<numero-CNJ>/<fecha>_<tipo>_<idDocumento>.pdf
 
-- Sanitizar el nombre **después** de decodificar latin-1
+- Sanitizar el nombre **después** de decodificar latin-1. El `idDocumento` es lo
+  que garantiza unicidad: sanitizar latin-1 puede colapsar dos nombres legibles
+  distintos en uno, así que la parte legible es decorativa y el id siempre va
 - Escribir a archivo temporal y renombrar al final, para que una interrupción no
   deje un PDF truncado que luego se dé por válido
 
