@@ -66,8 +66,24 @@ estrecha devuelve el total real sin aviso.
 La idea es cubrir el universo con muchas búsquedas acotadas en vez de una grande,
 achicando el filtro hasta que ninguna llegue al tope.
 
-**Pendiente de investigar:** si el filtro de "Data de Autuação" se comporta igual
-(topa en 30) y si funciona por sí solo. Es lo que decide la estrategia de barrido.
+**Resolución:** el filtro "Data de Autuação" sirve para esto. Funciona por sí solo
+(sin combinarlo con otros campos) y confirma el comportamiento esperado:
+
+| Rango consultado        | Filas | ¿Tope? |
+|-------------------------|-------|--------|
+| 01/01/2025 – 31/12/2025 | 30    | sí     |
+| 01/03/2025 – 07/03/2025 | 30    | sí     |
+| 05/03/2025 (un día)     | 10    | no     |
+| 08/03/2025 (un día)     | 18    | no     |
+
+Al achicar el rango deja de saturar y devuelve el total real. Entonces el barrido
+es: recorrer el histórico por ventanas de fechas y, cuando una ventana llegue a 30,
+partirla en dos y reintentar cada mitad, hasta que ninguna sature. Así se cubre
+todo sin agujeros y sin depender de una paginación que no existe.
+
+Detalle para la implementación: la búsqueda por fecha es el mismo POST del
+problema 1, llenando `dataAutuacaoInicioInputDate` y `dataAutuacaoFimInputDate`
+en formato `dd/MM/yyyy`.
 
 ---
 
@@ -81,7 +97,23 @@ Pero las partes y los movimientos vienen paginados **dentro** de la página (en 
 caso de prueba: 65 movimientos). El primer HTML no trae todo; hay que recorrer
 esos paginadores.
 
-**Pendiente de investigar:** cómo iterarlos.
+**Resolución:** son componentes `Richfaces.Datascroller`. Cambiar de página es otro
+POST AJAX, con esta forma:
+
+    AJAXREQUEST=_viewRoot
+    <idBase>=<idBase>                 # id del scroller sin el sufijo final
+    javax.faces.ViewState=<actual>
+    <idScroller>=2                    # numero de pagina destino
+    ajaxSingle=<idScroller>
+    AJAX:EVENTS_COUNT=1
+
+Verificado: pasar a la página 2 del polo activo cambia efectivamente la lista de
+participantes. Los ids de los scrollers (uno por tabla: polo activo, polo pasivo,
+movimientos) se leen del HTML del detalle, y el total de páginas sale del propio
+paginador (`«« « 1 2 3 ... » »»`).
+
+Ojo: el ViewState de la página de detalle es distinto al de la búsqueda, y hay que
+refrescarlo con cada respuesta.
 
 ---
 
