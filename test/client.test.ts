@@ -58,6 +58,31 @@ describe('encoding', () => {
     expect(html).not.toContain('Ã§');
     expect(html).not.toContain('Ã£');
   });
+
+  it('también decodifica UTF-8, que es lo que devuelven las respuestas AJAX', async () => {
+    // El sitio no es uniforme: las páginas completas vienen en latin-1, pero
+    // los POST responden en UTF-8. Ninguno declara charset en el cuerpo.
+    const utf8 = Buffer.from('É necessário informar ao menos dois nomes', 'utf8');
+    nock(BASE).post('/ajax').reply(200, utf8, { 'Content-Type': 'text/html' });
+
+    const { html } = await clienteRapido().post(`${BASE}/ajax`, new URLSearchParams());
+
+    expect(html).toBe('É necessário informar ao menos dois nomes');
+  });
+
+  it('distingue los dos encodings por los bytes, sin fiarse de la cabecera', async () => {
+    const mismoTexto = 'Ação';
+    nock(BASE)
+      .get('/latin')
+      .reply(200, Buffer.from(mismoTexto, 'latin1'), { 'Content-Type': 'text/html' })
+      .get('/utf')
+      .reply(200, Buffer.from(mismoTexto, 'utf8'), { 'Content-Type': 'text/html' });
+
+    const cliente = clienteRapido();
+
+    expect((await cliente.get(`${BASE}/latin`)).html).toBe(mismoTexto);
+    expect((await cliente.get(`${BASE}/utf`)).html).toBe(mismoTexto);
+  });
 });
 
 describe('reintentos ante 429', () => {

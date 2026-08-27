@@ -21,10 +21,27 @@ import {
 } from './backoff.js';
 
 /**
- * El sitio responde en ISO-8859-1. Decodificar como UTF-8 corrompe los acentos
- * ("APELAÇÃO" queda "APELAÃÃO"), así que se convierte explícitamente.
+ * El sitio **no usa un encoding uniforme**: las cargas de página completas
+ * llegan en ISO-8859-1, pero las respuestas AJAX de los POST llegan en UTF-8.
+ * Ninguna de las dos declara `charset` en el cuerpo, así que no se puede
+ * confiar en la cabecera.
+ *
+ * Se decide por los bytes: UTF-8 tiene una estructura que se puede validar, y
+ * un texto latin-1 con acentos casi nunca es UTF-8 válido por casualidad. Si
+ * decodifica como UTF-8, lo es; si no, es latin-1.
+ *
+ * Elegir mal corrompe todos los datos extraídos: "APELAÇÃO" queda "APELAÃÃO".
  */
-const ENCODING_DEL_SITIO = 'latin1';
+function decodificarSegunBytes(buffer: Buffer): string {
+  const comoUtf8 = buffer.toString('utf8');
+
+  // El carácter de reemplazo aparece cuando los bytes no son UTF-8 válido.
+  if (!comoUtf8.includes('�')) {
+    return comoUtf8;
+  }
+
+  return iconv.decode(buffer, 'latin1');
+}
 
 export interface HttpClientOptions {
   /** Espera mínima entre peticiones, en ms. Evita sobrecargar el servidor. */
@@ -162,7 +179,7 @@ export class HttpClient {
     }
 
     return {
-      html: iconv.decode(Buffer.from(respuesta.data as ArrayBuffer), ENCODING_DEL_SITIO),
+      html: decodificarSegunBytes(Buffer.from(respuesta.data as ArrayBuffer)),
       status: respuesta.status,
       url: respuesta.request?.res?.responseUrl ?? urlOriginal,
       headers,

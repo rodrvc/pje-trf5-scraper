@@ -191,13 +191,31 @@ en lote: hay que seguir el redirect en el momento, con la sesión viva.
 
 ---
 
-## 8. El sitio responde en ISO-8859-1
+## 8. El encoding del sitio no es uniforme
 
-No es UTF-8. Decodificado por defecto, los acentos se corrompen
-("APELAÇÃO" queda "APELAÃÃO"). Afecta tanto a los datos extraídos como a los
-nombres de archivo de los PDFs.
+Al principio se detectó que la página responde en ISO-8859-1 y no en UTF-8:
+decodificado por defecto, los acentos se corrompen ("APELAÇÃO" queda
+"APELAÃÃO").
 
-**Estado:** identificado — falta manejarlo en código.
+**Pero el sitio no usa un solo encoding.** Al capturar fixtures se comprobó,
+mirando los bytes crudos:
+
+| Petición | Encoding real | ¿Declara charset? |
+|---|---|---|
+| GET de la página | ISO-8859-1 | no |
+| POST (respuesta AJAX) | **UTF-8** | no |
+
+Como la búsqueda responde por AJAX, asumir latin-1 en todo habría corrompido
+**todos** los datos extraídos.
+
+**Resolución:** se decide por los bytes, no por la cabecera (que no viene). Se
+intenta decodificar como UTF-8; si el resultado contiene el carácter de
+reemplazo, los bytes no eran UTF-8 válido y se decodifica como latin-1. Un texto
+latin-1 con acentos casi nunca es UTF-8 válido por casualidad, así que la
+distinción es fiable.
+
+Implementado en `decodificarSegunBytes()` (`src/http/client.ts`), con tests que
+cubren ambos casos.
 
 ---
 
