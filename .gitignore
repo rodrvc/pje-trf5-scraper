@@ -1,0 +1,26 @@
+# dependencias
+node_modules/
+
+# build
+dist/
+*.tsbuildinfo
+
+# salida del scraper: son datos de un tribunal real y pesan
+data/
+pdfs/
+
+# logs
+*.log
+npm-debug.log*
+
+# entorno
+.env
+.env.local
+
+# sistema
+.DS_Store
+
+# skills de agentes: herramienta de trabajo local, no parte del entregable
+.agents/
+.claude/
+skills-lock.json
