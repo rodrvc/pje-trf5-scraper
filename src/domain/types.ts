@@ -114,8 +114,22 @@ export interface SearchResponse {
    * query rather than treat the coverage as complete.
    */
   capped: boolean;
+  /**
+   * How that verdict was reached. Kept so callers can report the two readings
+   * disagreeing, which is how a change in the server's warning wording would
+   * announce itself instead of passing unnoticed.
+   */
+  capSignal: CapSignal;
   /** Server rejection message, when it validated and discarded the query. */
   rejectionMessage?: string;
+}
+
+/** Both readings of the result cap, kept separate on purpose. */
+export interface CapSignal {
+  capped: boolean;
+  byText: boolean;
+  byCount: boolean;
+  disagree: boolean;
 }
 
 /** A judicial class from the catalog, used for partitioning. */

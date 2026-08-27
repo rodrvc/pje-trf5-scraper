@@ -4,6 +4,12 @@
  * Most cases use minimal inline HTML, so each test shows exactly what goes in
  * and what comes out. The real fixtures — full responses captured from PJe — are
  * kept for the cases where fidelity to the live markup is the point.
+ *
+ * What these fixtures can and cannot do: being frozen copies, they verify that
+ * the parsers still behave as they did against the markup as it was captured.
+ * They **cannot** detect that the live site has changed — by construction, a
+ * stored fixture never changes. Guarding against site drift needs a live check,
+ * which is what the startup preflight is for.
  */
 
 import { readFileSync } from 'node:fs';
@@ -11,7 +17,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import {
-  isCapped,
+  detectCap,
   extractRejectionMessage,
   parseResultRows,
   parseSearchResponse,
@@ -94,25 +100,55 @@ describe('parseResultRows', () => {
   });
 });
 
-describe('isCapped', () => {
-  const WARNING = 'somente os 30 primeiros processos serão exibidos';
+describe('detectCap', () => {
+  const WARNING = 'Sua consulta retornou muitos processos, somente os 30 primeiros';
 
-  it('flags the cap when the server says so', () => {
-    expect(isCapped(`<div>Sua consulta retornou muitos processos, ${WARNING}</div>`, 30)).toBe(true);
+  it('agrees with itself when the server warns and the page is full', () => {
+    expect(detectCap(`<div>${WARNING}</div>`, 30)).toEqual({
+      capped: true,
+      byText: true,
+      byCount: true,
+      disagree: false,
+    });
   });
 
-  it('flags the cap on row count alone, in case the warning ever goes missing', () => {
-    // Defensive: a silent truncation would leave an invisible coverage gap.
-    expect(isCapped('<div>no warning here</div>', 30)).toBe(true);
+  it('agrees with itself on an ordinary short response', () => {
+    expect(detectCap('<div>10 resultados</div>', 10)).toEqual({
+      capped: false,
+      byText: false,
+      byCount: false,
+      disagree: false,
+    });
   });
 
-  it('does not flag anything below the cap', () => {
-    expect(isCapped('<div>no warning here</div>', 29)).toBe(false);
+  it('flags disagreement when the page is full but the warning is missing', () => {
+    // This is how a change in the server's wording would announce itself. Folding
+    // both readings into one boolean would hide it forever behind the row count.
+    const signal = detectCap('<div>no warning at all</div>', 30);
+
+    expect(signal.capped).toBe(true); // still capped: the count is load-bearing
+    expect(signal.byCount).toBe(true);
+    expect(signal.byText).toBe(false);
+    expect(signal.disagree).toBe(true);
   });
 
-  it('agrees with the live site on a capped and an uncapped response', () => {
-    expect(isCapped(fixture('results-capped.html'), 30)).toBe(true);
-    expect(isCapped(fixture('results-uncapped.html'), 10)).toBe(false);
+  it('flags disagreement when the warning appears on a page that is not full', () => {
+    const signal = detectCap(`<div>${WARNING}</div>`, 12);
+
+    expect(signal.capped).toBe(true);
+    expect(signal.disagree).toBe(true);
+  });
+
+  it('does not flag a page one row short of the cap', () => {
+    expect(detectCap('<div>no warning</div>', 29).capped).toBe(false);
+  });
+
+  it('both readings agree on the live site responses', () => {
+    const capped = detectCap(fixture('results-capped.html'), 30);
+    const uncapped = detectCap(fixture('results-uncapped.html'), 10);
+
+    expect(capped).toMatchObject({ capped: true, byText: true, byCount: true, disagree: false });
+    expect(uncapped).toMatchObject({ capped: false, disagree: false });
   });
 });
 
@@ -148,6 +184,8 @@ describe('parseSearchResponse', () => {
 
     expect(response.rows).toHaveLength(30);
     expect(response.capped).toBe(true);
+    // Both readings agree, so nothing about the site has drifted.
+    expect(response.capSignal.disagree).toBe(false);
   });
 
   it('an ordinary query returns its rows and nothing else', () => {

@@ -7,7 +7,7 @@
 
 import * as cheerio from 'cheerio';
 
-import type { SearchResponse, SearchResultRow } from './types.js';
+import type { CapSignal, SearchResponse, SearchResultRow } from './types.js';
 import { CAP_WARNING, RESULT_CAP } from '../pje/constants.js';
 
 /** Unique CNJ number: 0000462-42.2023.8.17.3480 */
@@ -41,15 +41,30 @@ export function extractRejectionMessage(html: string): string | undefined {
 }
 
 /**
- * Detects that the query hit the cap and results are being withheld.
+ * Two independent readings of whether the query hit the result cap.
  *
- * Two signals are checked independently. The textual warning is the primary
- * source, but rows are counted too: if the site ever truncated without warning,
- * trusting the text alone would open a silent coverage gap — exactly what the
- * partitioning is meant to prevent.
+ * They are reported separately rather than collapsed into one boolean, because
+ * their **disagreement** is the interesting signal.
+ *
+ * `byCount` is the load-bearing one: reaching exactly the cap is a structural
+ * invariant of the server, not a translatable string. `byText` depends on
+ * matching Portuguese wording that a site update could change at any time.
+ *
+ * Folding them together with an OR — the original implementation — looks like
+ * defence in depth but is the opposite: the row count silently masks a broken
+ * text matcher forever, so the failure never surfaces. Keeping both visible
+ * means `byCount && !byText` can be surfaced as "the warning wording changed".
  */
-export function isCapped(html: string, rowCount: number): boolean {
-  return html.includes(CAP_WARNING) || rowCount >= RESULT_CAP;
+export function detectCap(html: string, rowCount: number): CapSignal {
+  const byText = html.includes(CAP_WARNING);
+  const byCount = rowCount >= RESULT_CAP;
+
+  return {
+    capped: byText || byCount,
+    byText,
+    byCount,
+    disagree: byText !== byCount,
+  };
 }
 
 /**
@@ -162,10 +177,12 @@ export function parseResultRows(html: string): SearchResultRow[] {
 export function parseSearchResponse(html: string): SearchResponse {
   const rejectionMessage = extractRejectionMessage(html);
   const rows = parseResultRows(html);
+  const cap = detectCap(html, rows.length);
 
   return {
     rows,
-    capped: isCapped(html, rows.length),
+    capped: cap.capped,
+    capSignal: cap,
     ...(rejectionMessage !== undefined ? { rejectionMessage } : {}),
   };
 }
