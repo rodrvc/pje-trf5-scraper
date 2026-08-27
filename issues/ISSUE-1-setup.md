@@ -1,63 +1,63 @@
 ---
 id: ISSUE-1
-titulo: Setup del proyecto
-estado: hecho
+title: Project setup
+status: done
 ---
 
-## Objetivo
+## Goal
 
-Dejar el proyecto listo para escribir código TypeScript.
+Get the project ready for writing TypeScript.
 
-## Alcance
+## Scope
 
-- `package.json` con dependencias y scripts de ejecución
+- `package.json` with dependencies and run scripts
 - `tsconfig.json`
 - `.gitignore`: `node_modules/`, `dist/`, `data/`, `pdfs/`, `*.log`
-- Estructura de carpetas `src/`
+- `src/` folder structure
 
-Dependencias previstas: `axios`, `cheerio`, `iconv-lite`, `tough-cookie`,
+Planned dependencies: `axios`, `cheerio`, `iconv-lite`, `tough-cookie`,
 `axios-cookiejar-support`. Dev: `typescript`, `@types/node`, `tsx`.
 
-**Restricción del enunciado:** prohibido Puppeteer, Playwright y Selenium.
+**Brief constraint:** Puppeteer, Playwright and Selenium are not allowed.
 
-## Criterio de aceptación
+## Acceptance
 
-- `npm install` y el proyecto compila.
-- Los datos scrapeados no se versionan.
+- `npm install` runs and the project compiles.
+- Scraped data is not versioned.
 
-## Resolución
+## Resolution
 
-Proyecto montado y verificado: `npm install` corre limpio (0 vulnerabilidades),
-`npm run typecheck` pasa y `npm test` ejecuta 4 tests en verde.
+Project set up and verified: `npm install` runs clean (0 vulnerabilities),
+`npm run typecheck` passes and `npm test` runs 4 tests green.
 
-**Estructura por capas**, con dependencias en una sola dirección:
+**Layered structure**, with dependencies flowing one way:
 
-    src/http/      transporte puro (no sabe qué es JSF)
-    src/pje/       protocolo JSF: sesión, ViewState, POSTs
-    src/domain/    tipos y parsers puros
-    src/pipeline/  orquestación
-    src/cli/       parser de flags
+    src/http/      transport only (knows nothing about JSF)
+    src/pje/       JSF protocol: session, ViewState, POSTs
+    src/domain/    types and pure parsers
+    src/pipeline/  orchestration
+    src/cli/       flag parsing
 
-**Ya escrito:**
+**Already written:**
 
-- `src/domain/types.ts` — `Proceso`, `Parte`, `Movimentacao`, `Documento`,
-  `Consulta`, `RespuestaBusqueda`, `ClaseJudicial`. Incluye `sigiloso` para
-  segredo de justiça y `saturada` para el tope de 30.
-- `src/domain/errors.ts` — errores tipados (`RateLimitError`,
+- `src/domain/types.ts` — `LegalCase`, `Party`, `Movement`, `CaseDocument`,
+  `Query`, `SearchResponse`, `JudicialClass`. Includes `sealed` for segredo de
+  justiça and `capped` for the 30-result cap.
+- `src/domain/errors.ts` — typed errors (`RateLimitError`,
   `SessionExpiredError`, `RejectedQueryError`, `ParseError`, `DownloadError`,
-  `CircuitBreakerError`), para aplicar políticas de reintento por clase en vez
-  de inspeccionar el texto del mensaje.
-- `test/errors.test.ts` — deja la suite operativa desde el primer commit.
+  `CircuitBreakerError`), so retry policy can key off the class instead of
+  inspecting message text.
+- `test/errors.test.ts` — keeps the suite live from the first commit.
 
-**Decisiones:**
+**Decisions:**
 
-- TypeScript en modo estricto, con `noUncheckedIndexedAccess` y
-  `exactOptionalPropertyTypes`: en un scraper que parsea HTML impredecible,
-  el compilador obliga a tratar los campos ausentes.
-- ESM nativo (`"type": "module"`), Node >= 20.
-- `tsx` para ejecutar sin paso de build; `vitest` + `nock` para los tests.
-- Los nombres del dominio se mantienen en portugués cuando son términos propios
-  del sistema judicial brasileño (autuação, polo ativo, movimentação).
+- Strict TypeScript with `noUncheckedIndexedAccess` and
+  `exactOptionalPropertyTypes`: when parsing unpredictable HTML, the compiler
+  should force absent fields to be handled.
+- Native ESM (`"type": "module"`), Node >= 20.
+- `tsx` to run without a build step; `vitest` + `nock` for tests.
+- Domain names stay in Portuguese where they are terms specific to the Brazilian
+  court system (autuação, polo ativo, movimentação).
 
-**Dependencias:** axios, axios-cookiejar-support, cheerio, iconv-lite,
-tough-cookie. Ninguna basada en navegador, como exige el enunciado.
+**Dependencies:** axios, axios-cookiejar-support, cheerio, iconv-lite,
+tough-cookie. None browser-based, as the brief requires.

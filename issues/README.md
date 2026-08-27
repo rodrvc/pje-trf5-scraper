@@ -1,23 +1,23 @@
-# Issues de implementación
+# Implementation issues
 
-Un issue por módulo del scraper. Se crea antes de implementarlo y la resolución
-se escribe dentro del propio archivo al cerrarlo.
+One issue per module. Created before implementing it; the resolution is written
+inside the file itself on close.
 
-Los obstáculos del sitio que motivan estos issues están en `../PROBLEMAS.md`.
+The site obstacles that motivate these issues live in `../PROBLEMS.md`.
 
-Estado del tablero:
+Board status:
 
-    grep -H '^estado:' issues/ISSUE-*.md
+    grep -H '^status:' issues/ISSUE-*.md
 
-| ID | Módulo | Estado |
+| ID | Module | Status |
 |----|--------|--------|
-| [ISSUE-1](ISSUE-1-setup.md) | Setup del proyecto | todo |
-| [ISSUE-2](ISSUE-2-cliente-http.md) | Cliente HTTP (sesión, latin-1, 429) | todo |
-| [ISSUE-3](ISSUE-3-busqueda.md) | Búsqueda de procesos | todo |
-| [ISSUE-4](ISSUE-4-barrido-fechas.md) | Barrido por ventanas de fecha | todo |
-| [ISSUE-5](ISSUE-5-detalle.md) | Detalle del proceso | todo |
-| [ISSUE-6](ISSUE-6-pdfs.md) | Descarga de PDFs | todo |
-| [ISSUE-7](ISSUE-7-persistencia.md) | Persistencia y reanudación | todo |
-| [ISSUE-8](ISSUE-8-cli-readme.md) | CLI, logging y README | todo |
-| [ISSUE-9](ISSUE-9-orquestador.md) | Orquestador del recorrido | todo |
-| [ISSUE-10](ISSUE-10-tests.md) | Suite de tests con fixtures | todo |
+| [ISSUE-1](ISSUE-1-setup.md) | Project setup | done |
+| [ISSUE-2](ISSUE-2-http-client.md) | HTTP client (session, encoding, 429) | done |
+| [ISSUE-3](ISSUE-3-search.md) | Case search | todo |
+| [ISSUE-4](ISSUE-4-date-sweep.md) | Date-window sweep | todo |
+| [ISSUE-5](ISSUE-5-case-detail.md) | Case detail | todo |
+| [ISSUE-6](ISSUE-6-pdfs.md) | PDF downloads | todo |
+| [ISSUE-7](ISSUE-7-persistence.md) | Persistence and resuming | todo |
+| [ISSUE-8](ISSUE-8-cli-readme.md) | CLI, logging and README | todo |
+| [ISSUE-9](ISSUE-9-orchestrator.md) | Sweep orchestrator | todo |
+| [ISSUE-10](ISSUE-10-tests.md) | Test suite with fixtures | todo |

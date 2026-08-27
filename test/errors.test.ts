@@ -8,29 +8,29 @@ import {
   SessionExpiredError,
 } from '../src/domain/errors.js';
 
-describe('errores del scraper', () => {
-  it('se distinguen por clase, sin inspeccionar el mensaje', () => {
-    const errores: ScraperError[] = [
+describe('scraper errors', () => {
+  it('are told apart by class, without inspecting the message', () => {
+    const errors: ScraperError[] = [
       new RateLimitError('429'),
-      new SessionExpiredError('sesión caída'),
-      new CircuitBreakerError('demasiados 429'),
+      new SessionExpiredError('session dropped'),
+      new CircuitBreakerError('too many 429s'),
     ];
 
-    expect(errores.filter((e) => e instanceof RateLimitError)).toHaveLength(1);
-    expect(errores.every((e) => e instanceof ScraperError)).toBe(true);
+    expect(errors.filter((e) => e instanceof RateLimitError)).toHaveLength(1);
+    expect(errors.every((e) => e instanceof ScraperError)).toBe(true);
   });
 
-  it('RateLimitError conserva el Retry-After del servidor', () => {
-    expect(new RateLimitError('429', 30).retryAfterSegundos).toBe(30);
-    expect(new RateLimitError('429').retryAfterSegundos).toBeUndefined();
+  it('RateLimitError keeps the server Retry-After', () => {
+    expect(new RateLimitError('429', 30).retryAfterSeconds).toBe(30);
+    expect(new RateLimitError('429').retryAfterSeconds).toBeUndefined();
   });
 
-  it('RejectedQueryError conserva el motivo que dio el servidor', () => {
-    const motivo = 'É necessário informar ao menos dois nomes';
-    expect(new RejectedQueryError('rechazada', motivo).mensajeServidor).toBe(motivo);
+  it('RejectedQueryError keeps the reason the server gave', () => {
+    const reason = 'É necessário informar ao menos dois nomes';
+    expect(new RejectedQueryError('rejected', reason).serverMessage).toBe(reason);
   });
 
-  it('cada error reporta su propio nombre de clase', () => {
+  it('each error reports its own class name', () => {
     expect(new SessionExpiredError('x').name).toBe('SessionExpiredError');
   });
 });

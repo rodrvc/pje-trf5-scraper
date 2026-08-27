@@ -1,116 +1,115 @@
-# Scraper del PJe — Consulta Pública del TRF5
+# PJe Scraper — TRF5 Public Case Search
 
-Scraper en TypeScript de la
-[Consulta Pública del PJe del TRF5](https://pjett.trf5.jus.br/pjeconsulta/ConsultaPublica/listView.seam),
-resuelto con **peticiones HTTP puras**: sin Puppeteer, Playwright ni Selenium.
+A TypeScript scraper for the
+[TRF5 PJe public case search](https://pjett.trf5.jus.br/pjeconsulta/ConsultaPublica/listView.seam),
+built on **plain HTTP requests**: no Puppeteer, Playwright or Selenium.
 
-> **Estado: en construcción.** Ver [el tablero de issues](issues/) para el avance.
+> **Status: work in progress.** See the [issue board](issues/) for current state.
 
 ---
 
-## Sobre la documentación de este repositorio
+## About the documentation in this repository
 
-Este repositorio incluye, **de forma deliberada**, la investigación previa al
-código. No son notas sueltas ni restos de trabajo: son parte del entregable.
+This repository deliberately includes the research that preceded the code. These
+are not stray notes or leftovers — they are part of the deliverable.
 
-| Documento | Qué contiene |
+| Document | Contents |
 |---|---|
-| [`PROBLEMAS.md`](PROBLEMAS.md) | Los 10 obstáculos que presenta el sitio, con la evidencia empírica de cada hallazgo y cómo se resolvió |
-| [`issues/`](issues/) | Un issue por módulo, con su resolución escrita al cerrarlo |
-| [`docs/`](docs/) | Scripts que reproducen los sondeos contra el sitio |
+| [`PROBLEMS.md`](PROBLEMS.md) | The 10 obstacles the site presents, with the evidence behind each finding and how it was resolved |
+| [`issues/`](issues/) | One issue per module, each with its resolution written on close |
+| [`docs/`](docs/) | Scripts that reproduce the probes against the live site |
 
-**Por qué están aquí.** El enunciado del desafío señala que *"descubrir la
-estructura del sitio, cómo funciona la paginación y qué información está
-disponible"* es parte del desafío. Buena parte del trabajo real no fue escribir
-el scraper, sino averiguar cómo responde un sistema JSF/Seam de 2010 que no
-tiene API, falla en silencio y sirve los PDFs por enlaces de un solo uso.
+**Why they are here.** The brief states that *"discovering the site structure, how
+pagination works and what information is available"* is part of the challenge. Most
+of the real work was not writing the scraper but working out how a 2010-era JSF/Seam
+system behaves when it has no API, fails silently, and serves PDFs through single-use
+links.
 
-Documentar esos hallazgos —incluidos los supuestos que resultaron **falsos** y
-las vías que se **descartaron**— deja explícito el razonamiento detrás de cada
-decisión de diseño. El caso más claro está en `PROBLEMAS.md` §5.
+Documenting those findings — including the assumptions that turned out to be **wrong**
+and the approaches that were **ruled out** — makes the reasoning behind each design
+decision explicit. The clearest case is `PROBLEMS.md` §5.
 
 ---
 
-## El hallazgo central: el sitio no tiene paginación
+## The central finding: the site has no pagination
 
-El enunciado pide "navegar por todas las páginas". **No existen páginas de
-resultados.** Ante una consulta amplia el sitio responde:
+The brief asks to "navigate through all pages". **There are no result pages.** Faced
+with a broad query the site answers:
 
-> *"Sua consulta retornou muitos processos e somente os 30 primeiros serão
-> exibidos. Por favor, refine sua pesquisa."*
+> *"Sua consulta retornou muitos processos e somente os 30 primeiros serão exibidos.
+> Por favor, refine sua pesquisa."*
 
-Corta en 30 y no ofrece forma de pedir los siguientes: no hay `?page=N`, ni
-control de paginación, ni parámetro de desplazamiento.
+It cuts off at 30 and offers no way to request the next batch: no `?page=N`, no
+pagination control, no offset parameter.
 
-Esto es verificable, no una conclusión a ojo:
+This is verifiable, not a judgement call:
 
-| Consulta | Filas | ¿Aviso de tope? |
+| Query | Rows | Cap warning? |
 |---|---|---|
-| Año 2025 completo | 30 | sí |
-| Una semana | 30 | sí |
-| Un día (05/03/2025) | 10 | no |
-| Un día (08/03/2025) | 18 | no |
+| All of 2025 | 30 | yes |
+| One week | 30 | yes |
+| One day (2025-03-05) | 10 | no |
+| One day (2025-03-08) | 18 | no |
 
-Y el contraste que lo confirma: el panel de resultados tiene **cero** controles
-de paginación, mientras que el detalle de un proceso **sí** los tiene
-(`Richfaces.Datascroller`, que el scraper recorre en ISSUE-5). No es que no se
-sepa recorrer un paginador; es que en los resultados no hay ninguno.
+And the contrast that confirms it: the results panel has **zero** pagination controls,
+while a case detail page **does** have them (`Richfaces.Datascroller`, which the
+scraper walks in ISSUE-5). It is not that paginators are beyond us — there simply
+is none on the results.
 
-**La solución** es cubrir el universo con muchas consultas acotadas en lugar de
-una grande, subdividiendo en cascada por dos dimensiones:
+**The solution** is to cover the corpus with many narrow queries instead of one broad
+one, splitting along two dimensions in cascade:
 
-1. **Rango de fechas de autuação** — partir el rango en dos cuando sature
-2. **Clase judicial** — cuando un solo día siga saturando
+1. **Filing date range (autuação)** — halve the range when it saturates
+2. **Judicial class** — when a single day still saturates
 
-La segunda dimensión resultó imprescindible: sondeando marzo de 2025, **6 de 13
-días llegan al tope por sí solos**. Los detalles y las tablas completas están en
-`PROBLEMAS.md` §5.
+The second dimension proved essential: probing March 2025, **6 out of 13 days hit the
+cap on their own**. Full tables and details in `PROBLEMS.md` §5.
 
 ---
 
-## Instalación
+## Installation
 
 ```bash
 npm install
 ```
 
-Requiere Node.js 20 o superior.
+Requires Node.js 20 or newer.
 
-## Uso
+## Usage
 
 ```bash
-npm run scrape     # ejecuta el scraper
-npm test           # suite de tests (no requiere red)
-npm run typecheck  # verificación de tipos
+npm run scrape     # run the scraper
+npm test           # test suite (no network required)
+npm run typecheck  # type checking
 ```
 
-> Las instrucciones detalladas de ejecución se completan en ISSUE-8.
+> Detailed run instructions land with ISSUE-8.
 
-## Arquitectura
+## Architecture
 
-Capas con dependencias en una sola dirección:
+Layers with dependencies flowing one way:
 
 ```
-src/http/      transporte puro: cookies, redirects, encoding, ritmo, reintentos
-src/pje/       protocolo JSF: sesión, ViewState, POSTs del formulario
-src/domain/    tipos y parsers puros
-src/pipeline/  orquestación del recorrido
-src/cli/       parser de flags
+src/http/      transport only: cookies, redirects, encoding, pacing, retries
+src/pje/       JSF protocol: session, ViewState, form POSTs
+src/domain/    types and pure parsers
+src/pipeline/  sweep orchestration
+src/cli/       flag parsing
 ```
 
-El transporte no sabe qué es JSF, y los parsers son funciones puras
-`(html: string) => T`, lo que permite probarlos sin red.
+The transport layer knows nothing about JSF, and the parsers are pure
+`(html: string) => T` functions, which makes them testable without a network.
 
-## Consideración con el servidor
+## Consideration for the server
 
-El PJe del TRF5 es un servicio público en producción de un tribunal real. El
-scraper usa **concurrencia 1** y un delay configurable entre peticiones, y corta
-la ejecución si acumula respuestas 429 seguidas en vez de insistir.
+TRF5's PJe is a real court's public production service. The scraper uses
+**concurrency 1** and a configurable delay between requests, and it aborts the run if
+consecutive 429s pile up rather than pressing on.
 
-Durante toda la investigación no se llegó a provocar un 429. El manejo de rate
-limiting está implementado igualmente —lo exige el enunciado— y se demuestra con
-**tests contra un servidor simulado**, no castigando el sitio real.
+No 429 was ever triggered during the research. Rate-limit handling is implemented
+regardless — the brief requires it — and is demonstrated through **tests against a
+simulated server**, not by hammering the live site.
 
-## Licencia
+## License
 
 MIT

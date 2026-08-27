@@ -1,145 +1,144 @@
 /**
- * Sesión JSF sobre el cliente HTTP.
+ * JSF session on top of the HTTP client.
  *
- * JSF exige que cada POST incluya el `javax.faces.ViewState` de la vista desde
- * la que se envía. Sin el par cookie + ViewState correcto el servidor responde
- * 200 con HTML válido pero sin resultados: falla en silencio, que es la parte
- * desagradable de depurar.
+ * JSF requires every POST to carry the `javax.faces.ViewState` of the view it is
+ * sent from. Without the right cookie + ViewState pair the server answers 200
+ * with valid HTML but no results: it fails silently, which is the unpleasant
+ * part to debug.
  *
- * El ViewState se guarda **por vista**, no como valor único: el de la página de
- * detalle es distinto al de la búsqueda, y mezclarlos rompe la navegación.
+ * ViewState is stored **per view**, not as a single value: the detail page has a
+ * different one from the search page, and mixing them breaks navigation.
  */
 
-import type { HttpClient, RespuestaTexto } from '../http/client.js';
+import type { HttpClient, TextResponse } from '../http/client.js';
 import { ParseError, SessionExpiredError } from '../domain/errors.js';
 
 export const BASE_URL = 'https://pjett.trf5.jus.br/pjeconsulta';
 
-/** Las vistas que recorre el scraper. */
-export const VISTAS = {
-  busqueda: '/ConsultaPublica/listView.seam',
-  detalle: '/ConsultaPublica/DetalheProcessoConsultaPublica/listView.seam',
+/** The views the scraper walks through. */
+export const VIEWS = {
+  search: '/ConsultaPublica/listView.seam',
+  detail: '/ConsultaPublica/DetalheProcessoConsultaPublica/listView.seam',
 } as const;
 
-export type Vista = keyof typeof VISTAS;
+export type View = keyof typeof VIEWS;
 
 const RE_VIEW_STATE = /name="javax\.faces\.ViewState"[^>]*value="([^"]*)"/;
 
-/** Extrae el ViewState de una respuesta. Función pura, testeable sin red. */
-export function extraerViewState(html: string): string | undefined {
+/** Extracts the ViewState from a response. Pure function, testable without network. */
+export function extractViewState(html: string): string | undefined {
   return RE_VIEW_STATE.exec(html)?.[1];
 }
 
 /**
- * Detecta que la sesión caducó.
+ * Detects that the session expired.
  *
- * El PJe no responde 401 ni 403: devuelve 200 con el formulario de búsqueda
- * vacío, como si acabaras de entrar. Se reconoce porque falta lo que la vista
- * debería contener.
+ * PJe answers neither 401 nor 403: it returns 200 with an empty search form, as
+ * if you had just arrived. It is recognized by what the view is missing.
  */
-export function pareceSesionCaida(html: string, vista: Vista): boolean {
-  if (vista === 'detalle') {
-    // El detalle siempre trae esta cabecera; si no está, no estamos en el detalle.
+export function looksLikeExpiredSession(html: string, view: View): boolean {
+  if (view === 'detail') {
+    // The detail view always carries this heading; without it we are not there.
     return !html.includes('Dados do Processo');
   }
-  // En búsqueda, la desaparición del formulario indica que ya no hay vista viva.
+  // On search, a missing form means there is no live view left.
   return !html.includes('javax.faces.ViewState');
 }
 
 export class JsfSession {
-  /** ViewState por vista. */
-  private readonly viewStates = new Map<Vista, string>();
+  /** ViewState per view. */
+  private readonly viewStates = new Map<View, string>();
 
   constructor(private readonly http: HttpClient) {}
 
-  url(vista: Vista, query?: string): string {
-    return `${BASE_URL}${VISTAS[vista]}${query ?? ''}`;
+  url(view: View, query?: string): string {
+    return `${BASE_URL}${VIEWS[view]}${query ?? ''}`;
   }
 
   /**
-   * Abre una vista y guarda su ViewState.
+   * Opens a view and stores its ViewState.
    *
-   * Es el punto de entrada obligatorio: sin haber cargado la vista no hay
-   * ViewState que enviar en los POST posteriores.
+   * This is the mandatory entry point: without having loaded the view there is
+   * no ViewState to send in subsequent POSTs.
    */
-  async abrir(vista: Vista, query?: string): Promise<RespuestaTexto> {
-    const respuesta = await this.http.get(this.url(vista, query), {
-      Referer: this.url('busqueda'),
+  async open(view: View, query?: string): Promise<TextResponse> {
+    const response = await this.http.get(this.url(view, query), {
+      Referer: this.url('search'),
     });
-    this.registrarViewState(vista, respuesta.html);
-    return respuesta;
+    this.rememberViewState(view, response.html);
+    return response;
   }
 
   /**
-   * Envía un POST de la vista indicada, añadiendo su ViewState.
+   * Sends a POST for the given view, adding its ViewState.
    *
-   * Si la respuesta revela que la sesión caducó, la reestablece y reintenta una
-   * vez. Un solo reintento basta: si vuelve a caer, el problema es otro y
-   * conviene que se propague en vez de entrar en bucle.
+   * If the response reveals an expired session, it re-establishes and retries
+   * once. One retry is enough: a second failure means something else is wrong
+   * and should propagate rather than loop.
    */
-  async postear(
-    vista: Vista,
-    campos: URLSearchParams,
-    opciones: { query?: string; reintentarSiCaduca?: boolean } = {},
-  ): Promise<RespuestaTexto> {
-    const { query, reintentarSiCaduca = true } = opciones;
+  async post(
+    view: View,
+    fields: URLSearchParams,
+    options: { query?: string; retryIfExpired?: boolean } = {},
+  ): Promise<TextResponse> {
+    const { query, retryIfExpired = true } = options;
 
-    const viewState = this.viewStates.get(vista);
+    const viewState = this.viewStates.get(view);
     if (viewState === undefined) {
       throw new ParseError(
-        `No hay ViewState para la vista "${vista}": hay que abrirla antes de postear.`,
+        `No ViewState for view "${view}": it must be opened before posting.`,
       );
     }
 
-    const cuerpo = new URLSearchParams(campos);
-    cuerpo.set('javax.faces.ViewState', viewState);
+    const body = new URLSearchParams(fields);
+    body.set('javax.faces.ViewState', viewState);
 
-    const respuesta = await this.http.post(this.url(vista, query), cuerpo, {
-      Referer: this.url(vista, query),
+    const response = await this.http.post(this.url(view, query), body, {
+      Referer: this.url(view, query),
       'X-Requested-With': 'XMLHttpRequest',
     });
 
-    this.registrarViewState(vista, respuesta.html);
+    this.rememberViewState(view, response.html);
 
-    if (this.respuestaIndicaSesionCaida(respuesta, vista)) {
-      if (!reintentarSiCaduca) {
-        throw new SessionExpiredError(`La sesión caducó al postear en "${vista}".`);
+    if (this.signalsExpiredSession(response, view)) {
+      if (!retryIfExpired) {
+        throw new SessionExpiredError(`Session expired while posting to "${view}".`);
       }
-      await this.reestablecer(vista, query);
-      return this.postear(vista, campos, { ...opciones, reintentarSiCaduca: false });
+      await this.reestablish(view, query);
+      return this.post(view, fields, { ...options, retryIfExpired: false });
     }
 
-    return respuesta;
+    return response;
   }
 
-  /** Descarta la sesión actual y vuelve a abrir la vista desde cero. */
-  async reestablecer(vista: Vista, query?: string): Promise<void> {
-    await this.http.reiniciarSesion();
+  /** Discards the current session and reopens the view from scratch. */
+  async reestablish(view: View, query?: string): Promise<void> {
+    await this.http.resetSession();
     this.viewStates.clear();
-    await this.abrir(vista, query);
+    await this.open(view, query);
   }
 
-  viewStateDe(vista: Vista): string | undefined {
-    return this.viewStates.get(vista);
+  viewStateFor(view: View): string | undefined {
+    return this.viewStates.get(view);
   }
 
-  private registrarViewState(vista: Vista, html: string): void {
-    const viewState = extraerViewState(html);
+  private rememberViewState(view: View, html: string): void {
+    const viewState = extractViewState(html);
     if (viewState !== undefined) {
-      this.viewStates.set(vista, viewState);
+      this.viewStates.set(view, viewState);
     }
   }
 
   /**
-   * Una respuesta AJAX parcial no trae la página entera, así que no se puede
-   * juzgar con el mismo criterio que una carga completa: solo se considera
-   * caída si además perdió el ViewState.
+   * A partial AJAX response does not carry the whole page, so it cannot be
+   * judged by the same standard as a full load: it only counts as expired if it
+   * also lost the ViewState.
    */
-  private respuestaIndicaSesionCaida(respuesta: RespuestaTexto, vista: Vista): boolean {
-    const esRespuestaAjax = respuesta.html.includes('Ajax-Response');
-    if (esRespuestaAjax) {
-      return extraerViewState(respuesta.html) === undefined;
+  private signalsExpiredSession(response: TextResponse, view: View): boolean {
+    const isAjaxResponse = response.html.includes('Ajax-Response');
+    if (isAjaxResponse) {
+      return extractViewState(response.html) === undefined;
     }
-    return pareceSesionCaida(respuesta.html, vista);
+    return looksLikeExpiredSession(response.html, view);
   }
 }

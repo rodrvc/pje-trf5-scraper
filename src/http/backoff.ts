@@ -1,93 +1,93 @@
 /**
- * Cálculo de la espera entre reintentos.
+ * Retry delay computation.
  *
- * Se separa del cliente HTTP porque es lógica pura: dado un número de intento y
- * una cabecera opcional del servidor, devuelve cuántos milisegundos esperar.
- * Así se puede probar exhaustivamente sin red de por medio, que es lo que hace
- * demostrable el manejo de 429 sin castigar el sitio real.
+ * Kept apart from the HTTP client because it is pure logic: given an attempt
+ * number and an optional server header, it returns how many milliseconds to
+ * wait. That makes it exhaustively testable without a network, which is what
+ * makes the 429 handling demonstrable without hammering the live site.
  */
 
 export interface BackoffOptions {
-  /** Espera del primer reintento, en ms. Los siguientes se duplican. */
+  /** Delay for the first retry, in ms. Each subsequent one doubles. */
   baseMs: number;
-  /** Techo de la espera, en ms. Evita esperas absurdas en intentos altos. */
+  /** Delay ceiling, in ms. Keeps high attempt counts from waiting absurdly long. */
   maxMs: number;
   /**
-   * Proporción de aleatoriedad, entre 0 y 1.
+   * Randomness ratio between 0 and 1.
    *
-   * Sin jitter, varias peticiones que fallan a la vez reintentarían
-   * sincronizadas y volverían a chocar. Con 0.3 la espera varía ±30%.
+   * Without jitter, requests that fail at the same time would retry in lockstep
+   * and collide again. At 0.3 the delay varies by ±30%.
    */
   jitter: number;
 }
 
-export const BACKOFF_POR_DEFECTO: BackoffOptions = {
+export const DEFAULT_BACKOFF: BackoffOptions = {
   baseMs: 1_000,
   maxMs: 60_000,
   jitter: 0.3,
 };
 
 /**
- * Interpreta la cabecera `Retry-After`, que puede venir en dos formatos:
- * segundos ("120") o fecha HTTP ("Wed, 21 Oct 2026 07:28:00 GMT").
+ * Parses the `Retry-After` header, which comes in two formats: seconds ("120")
+ * or an HTTP date ("Wed, 21 Oct 2026 07:28:00 GMT").
  *
- * @param ahoraMs Momento actual, inyectable para poder probar el formato fecha.
- * @returns Milisegundos de espera, o `undefined` si la cabecera falta o no se
- *   entiende. Nunca devuelve negativo: una fecha ya pasada equivale a 0.
+ * @param nowMs Current time, injectable so the date format can be tested.
+ * @returns Milliseconds to wait, or `undefined` when the header is missing or
+ *   unparseable. Never negative: a date already in the past means 0.
  */
 export function parseRetryAfter(
-  valor: string | undefined,
-  ahoraMs: number = Date.now(),
+  value: string | undefined,
+  nowMs: number = Date.now(),
 ): number | undefined {
-  if (valor === undefined) return undefined;
+  if (value === undefined) return undefined;
 
-  const texto = valor.trim();
-  if (texto === '') return undefined;
+  const text = value.trim();
+  if (text === '') return undefined;
 
-  // Formato en segundos.
-  if (/^\d+$/.test(texto)) {
-    return Number(texto) * 1_000;
+  // Seconds format.
+  if (/^\d+$/.test(text)) {
+    return Number(text) * 1_000;
   }
 
-  // Formato fecha HTTP.
-  const fechaMs = Date.parse(texto);
-  if (Number.isNaN(fechaMs)) return undefined;
+  // HTTP date format.
+  const targetMs = Date.parse(text);
+  if (Number.isNaN(targetMs)) return undefined;
 
-  return Math.max(0, fechaMs - ahoraMs);
+  return Math.max(0, targetMs - nowMs);
 }
 
 /**
- * Calcula cuánto esperar antes del siguiente intento.
+ * Computes how long to wait before the next attempt.
  *
- * El `Retry-After` del servidor tiene prioridad sobre el cálculo propio: si el
- * servidor dice cuánto esperar, obedecerlo es lo correcto. Igual se le aplica
- * el techo, para que un valor desmedido no cuelgue la ejecución.
+ * The server's `Retry-After` takes precedence over our own calculation: if the
+ * server says how long to wait, obeying it is the right call. The ceiling still
+ * applies, so an outlandish value cannot stall the run.
  *
- * @param intento Número de reintento, empezando en 1.
- * @param aleatorio Fuente de aleatoriedad, inyectable para tests deterministas.
+ * @param attempt Retry number, starting at 1.
+ * @param random Randomness source, injectable for deterministic tests.
  */
-export function calcularEspera(
-  intento: number,
-  opciones: BackoffOptions = BACKOFF_POR_DEFECTO,
+export function computeDelay(
+  attempt: number,
+  options: BackoffOptions = DEFAULT_BACKOFF,
   retryAfterMs?: number,
-  aleatorio: () => number = Math.random,
+  random: () => number = Math.random,
 ): number {
-  const { baseMs, maxMs, jitter } = opciones;
+  const { baseMs, maxMs, jitter } = options;
 
   if (retryAfterMs !== undefined) {
     return Math.min(retryAfterMs, maxMs);
   }
 
-  // Exponencial: base * 2^(intento-1), acotado al techo.
-  const exponencial = Math.min(baseMs * 2 ** Math.max(0, intento - 1), maxMs);
+  // Exponential: base * 2^(attempt-1), capped at the ceiling.
+  const exponential = Math.min(baseMs * 2 ** Math.max(0, attempt - 1), maxMs);
 
-  // Jitter simétrico: ±(jitter * 100)% alrededor del valor calculado.
-  const desviacion = exponencial * jitter * (aleatorio() * 2 - 1);
+  // Symmetric jitter: ±(jitter * 100)% around the computed value.
+  const deviation = exponential * jitter * (random() * 2 - 1);
 
-  return Math.max(0, Math.round(exponencial + desviacion));
+  return Math.max(0, Math.round(exponential + deviation));
 }
 
-/** Pausa la ejecución. */
-export function esperar(ms: number): Promise<void> {
+/** Pauses execution. */
+export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

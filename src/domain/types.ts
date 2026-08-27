@@ -1,125 +1,125 @@
 /**
- * Tipos del dominio: procesos judiciales del PJe.
+ * Domain types: PJe legal cases.
  *
- * La nomenclatura de los campos se mantiene en portugués cuando corresponde a
- * un término propio del sistema judicial brasileño (autuação, polo ativo,
- * movimentação). Traducirlos haría más difícil rastrear de dónde sale cada dato.
+ * Field names stay in Portuguese where they refer to a concept specific to the
+ * Brazilian court system (autuação, polo ativo, movimentação). Translating those
+ * would make it harder to trace where each piece of data comes from.
  */
 
-/** Un participante del proceso: parte, abogado o representante. */
-export interface Parte {
-  nombre: string;
-  /** Rol procesal: APELANTE, APELADO, ADVOGADO, etc. */
-  tipo: string;
-  /** Documento de identidad. Ausente en participantes que no lo publican. */
-  documento?: { tipo: 'CPF' | 'CNPJ'; numero: string };
-  /** Inscripción de abogado, cuando el participante lo es. */
+/** A case participant: party, attorney or representative. */
+export interface Party {
+  name: string;
+  /** Procedural role: APELANTE, APELADO, ADVOGADO, etc. */
+  role: string;
+  /** Identity document. Absent for participants that do not publish one. */
+  document?: { kind: 'CPF' | 'CNPJ'; value: string };
+  /** Bar registration, when the participant is an attorney. */
   oab?: string;
-  situacion?: string;
+  status?: string;
 }
 
-/** Una entrada del histórico de movimientos del proceso. */
-export interface Movimentacao {
-  /** Fecha en ISO 8601. */
-  fecha: string;
-  descripcion: string;
+/** An entry in the case history (movimentação). */
+export interface Movement {
+  /** ISO 8601 date. */
+  date: string;
+  description: string;
 }
 
 /**
- * Un documento adjunto al proceso.
+ * A document attached to the case.
  *
- * Los cuatro identificadores son los que exige el enlace de descarga; no se
- * pueden derivar unos de otros, así que se guardan todos.
+ * All four identifiers are required by the download link and none can be derived
+ * from the others, so they are all kept.
  */
-export interface Documento {
-  /** Fecha en ISO 8601. */
-  fecha: string;
-  /** Nombre visible: "Despacho", "Acórdão"... */
-  nombre: string;
-  /** Tipo declarado por el sistema. */
-  tipo: string;
+export interface CaseDocument {
+  /** ISO 8601 date. */
+  date: string;
+  /** Display name: "Despacho", "Acórdão"... */
+  name: string;
+  /** Type as declared by the system. */
+  kind: string;
   idBin: string;
   numeroDocumento: string;
   idProcessoDocumento: string;
-  /** Ruta local del PDF, una vez descargado. */
-  rutaLocal?: string;
+  /** Local path of the PDF once downloaded. */
+  localPath?: string;
 }
 
-/** Un proceso judicial con todo lo que la consulta pública expone. */
-export interface Proceso {
-  /** Número único CNJ. Es la clave de deduplicación. */
-  numero: string;
+/** A legal case with everything the public search exposes. */
+export interface LegalCase {
+  /** Unique CNJ number. Used as the deduplication key. */
+  number: string;
   /**
-   * Token de acceso al detalle. Verificado: no caduca con la sesión, así que
-   * puede persistirse para reanudar sin repetir la búsqueda.
+   * Access token for the detail view. Verified not to expire with the session,
+   * so it can be persisted to resume without re-running the search.
    */
   ca: string;
 
-  claseJudicial?: string;
-  asunto?: string;
-  /** Fecha de autuación en ISO 8601. */
-  fechaAutuacion?: string;
-  jurisdiccion?: string;
-  organoJulgador?: string;
-  direccion?: string;
-  procesoReferencia?: string;
+  judicialClass?: string;
+  subject?: string;
+  /** Filing date (autuação) in ISO 8601. */
+  filingDate?: string;
+  jurisdiction?: string;
+  court?: string;
+  address?: string;
+  referenceCase?: string;
 
-  poloActivo: Parte[];
-  poloPasivo: Parte[];
-  movimentacoes: Movimentacao[];
-  documentos: Documento[];
+  activeParties: Party[];
+  passiveParties: Party[];
+  movements: Movement[];
+  documents: CaseDocument[];
 
   /**
-   * Proceso en segredo de justiça: el sistema devuelve detalle parcial o lo
-   * deniega. No es un error, es un estado válido del dominio.
+   * Case under segredo de justiça: the system returns partial detail or denies
+   * it. Not an error, but a valid domain state.
    */
-  sigiloso: boolean;
+  sealed: boolean;
 
-  /** Momento de la extracción, en ISO 8601. */
-  extraidoEn: string;
+  /** Extraction timestamp, ISO 8601. */
+  extractedAt: string;
 }
 
-/** Una fila de la tabla de resultados, antes de entrar al detalle. */
-export interface ResultadoBusqueda {
-  numero: string;
+/** A row from the results table, before opening the detail view. */
+export interface SearchResultRow {
+  number: string;
   ca: string;
-  claseJudicial?: string;
-  asunto?: string;
-  partes?: string;
-  ultimaMovimentacao?: string;
+  judicialClass?: string;
+  subject?: string;
+  parties?: string;
+  lastMovement?: string;
 }
 
 /**
- * Criterios de una consulta.
+ * Search criteria.
  *
- * El barrido genera muchas de estas, cada vez más acotadas, hasta que ninguna
- * llegue al tope de 30 que impone el sitio.
+ * The sweep generates many of these, progressively narrower, until none of them
+ * hits the 30-result cap the site imposes.
  */
-export interface Consulta {
-  /** Inicio del rango de autuación, en ISO 8601. */
-  desde: string;
-  /** Fin del rango de autuación, en ISO 8601. */
-  hasta: string;
-  /** Id interno de la clase judicial, para la segunda dimensión de partición. */
-  claseJudicialId?: string;
-  /** Nombre de la clase, que el formulario exige junto con el id. */
-  claseJudicialNombre?: string;
+export interface Query {
+  /** Start of the filing date range, ISO 8601. */
+  from: string;
+  /** End of the filing date range, ISO 8601. */
+  to: string;
+  /** Internal judicial class id, for the second partition dimension. */
+  judicialClassId?: string;
+  /** Class name, which the form requires alongside the id. */
+  judicialClassName?: string;
 }
 
-/** Resultado de ejecutar una consulta. */
-export interface RespuestaBusqueda {
-  resultados: ResultadoBusqueda[];
+/** Outcome of running a query. */
+export interface SearchResponse {
+  rows: SearchResultRow[];
   /**
-   * La consulta llegó al tope y hay resultados que no se ven. Quien la reciba
-   * debe subdividir la consulta en vez de dar la cobertura por completa.
+   * The query hit the cap and results are being withheld. Callers must split the
+   * query rather than treat the coverage as complete.
    */
-  saturada: boolean;
-  /** Mensaje de rechazo del servidor, si validó y descartó la consulta. */
-  mensajeRechazo?: string;
+  capped: boolean;
+  /** Server rejection message, when it validated and discarded the query. */
+  rejectionMessage?: string;
 }
 
-/** Una clase judicial del catálogo, para particionar. */
-export interface ClaseJudicial {
+/** A judicial class from the catalog, used for partitioning. */
+export interface JudicialClass {
   id: string;
-  nombre: string;
+  name: string;
 }

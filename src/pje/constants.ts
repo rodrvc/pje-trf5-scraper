@@ -1,77 +1,78 @@
 /**
- * Identificadores del formulario de búsqueda del PJe.
+ * Identifiers of the PJe search form.
  *
- * ATENCIÓN: los `j_idNNN` son ids que JSF autogenera según el orden de los
- * componentes en la vista. **Cambian si el tribunal redespliega la aplicación**,
- * y cuando eso pase el scraper dejará de encontrar resultados sin dar error.
+ * WARNING: the `j_idNNN` values are ids JSF generates from the order of the
+ * components in the view. **They change if the court redeploys the
+ * application**, and when that happens the scraper stops finding results without
+ * raising any error.
  *
- * Por eso están todos aquí y no dispersos por el código, y por eso
- * `descubrirIdBusqueda()` los deriva del HTML en tiempo de ejecución en vez de
- * confiar ciegamente en la constante.
+ * That is why they all live here instead of being scattered through the code,
+ * and why `discoverSearchComponentId()` derives them from the markup at runtime
+ * rather than trusting the constant blindly.
  *
- * Cómo redescubrirlos si dejan de funcionar:
+ * How to rediscover them if they stop working:
  *
- *   1. Abrir la página de búsqueda y ver el fuente.
- *   2. Buscar `executarPesquisa=function()`. El id del componente que dispara
- *      la búsqueda es el que aparece en `'parameters':{'fPP:j_idNNN': ...}`.
- *   3. Los nombres de los campos salen de los `name="..."` del formulario `fPP`.
+ *   1. Open the search page and view the source.
+ *   2. Look for `executarPesquisa=function()`. The id of the component that
+ *      triggers the search is the one in `'parameters':{'fPP:j_idNNN': ...}`.
+ *   3. Field names come from the `name="..."` attributes of the `fPP` form.
  */
 
-/** El formulario de búsqueda. */
-export const FORM_BUSQUEDA = 'fPP';
+/** The search form. */
+export const SEARCH_FORM = 'fPP';
 
 /**
- * Componente que ejecuta la búsqueda.
+ * The component that runs the search.
  *
- * No es el botón visible: `fPP:searchProcessos` existe en el HTML pero enviarlo
- * no dispara la consulta — el servidor responde 200 y solo refresca el panel de
- * mensajes. El botón llama por JavaScript a `executarPesquisa()`, que envía este
- * otro componente.
+ * Not the visible button: `fPP:searchProcessos` exists in the markup, but
+ * submitting it does not trigger the query — the server answers 200 and only
+ * refreshes the message panel. The button calls `executarPesquisa()` in
+ * JavaScript, which submits this component instead.
  */
-export const ID_BOTON_BUSQUEDA = 'fPP:j_id244';
+export const SEARCH_COMPONENT_ID = 'fPP:j_id244';
 
-/** Campos del formulario de búsqueda. */
-export const CAMPOS = {
-  numeroProceso:
+/** Search form fields. */
+export const FIELDS = {
+  caseNumber:
     'fPP:numProcesso-inputNumeroProcessoDecoration:numProcesso-inputNumeroProcesso',
-  procesoReferencia: 'fPP:j_id162:processoReferenciaInput',
-  nombreParte: 'fPP:dnp:nomeParte',
-  nombreAbogado: 'fPP:j_id180:nomeAdv',
-  claseJudicial: 'fPP:j_id189:classeJudicial',
-  /** El autocompletado exige el id interno de la clase, no su nombre. */
-  claseJudicialId: 'fPP:j_id189:sgbClasseJudicial_selection',
-  /** Caja de sugerencias, para pedir el catálogo de clases. */
-  claseJudicialSuggestion: 'fPP:j_id189:sgbClasseJudicial',
-  documentoParte: 'fPP:dpDec:documentoParte',
-  numeroOAB: 'fPP:Decoration:numeroOAB',
-  letraOAB: 'fPP:Decoration:j_id223',
-  estadoOAB: 'fPP:Decoration:estadoComboOAB',
-  fechaAutuacionDesde: 'fPP:dataAutuacaoDecoration:dataAutuacaoInicioInputDate',
-  fechaAutuacionDesdeActual: 'fPP:dataAutuacaoDecoration:dataAutuacaoInicioInputCurrentDate',
-  fechaAutuacionHasta: 'fPP:dataAutuacaoDecoration:dataAutuacaoFimInputDate',
-  fechaAutuacionHastaActual: 'fPP:dataAutuacaoDecoration:dataAutuacaoFimInputCurrentDate',
+  referenceCase: 'fPP:j_id162:processoReferenciaInput',
+  partyName: 'fPP:dnp:nomeParte',
+  attorneyName: 'fPP:j_id180:nomeAdv',
+  judicialClass: 'fPP:j_id189:classeJudicial',
+  /** The autocomplete requires the internal class id, not its display name. */
+  judicialClassId: 'fPP:j_id189:sgbClasseJudicial_selection',
+  /** Suggestion box, used to fetch the class catalog. */
+  judicialClassSuggestion: 'fPP:j_id189:sgbClasseJudicial',
+  partyDocument: 'fPP:dpDec:documentoParte',
+  oabNumber: 'fPP:Decoration:numeroOAB',
+  oabLetter: 'fPP:Decoration:j_id223',
+  oabState: 'fPP:Decoration:estadoComboOAB',
+  filingDateFrom: 'fPP:dataAutuacaoDecoration:dataAutuacaoInicioInputDate',
+  filingDateFromMonth: 'fPP:dataAutuacaoDecoration:dataAutuacaoInicioInputCurrentDate',
+  filingDateTo: 'fPP:dataAutuacaoDecoration:dataAutuacaoFimInputDate',
+  filingDateToMonth: 'fPP:dataAutuacaoDecoration:dataAutuacaoFimInputCurrentDate',
 } as const;
 
-/** Valor que usa Seam para "ningún elemento seleccionado" en los combos. */
-export const SIN_SELECCION = 'org.jboss.seam.ui.NoSelectionConverter.noSelectionValue';
+/** Value Seam uses for "nothing selected" in dropdowns. */
+export const NO_SELECTION = 'org.jboss.seam.ui.NoSelectionConverter.noSelectionValue';
 
-/** Máximo de resultados que el sitio devuelve por consulta. No es configurable. */
-export const TOPE_RESULTADOS = 30;
+/** Maximum results the site returns per query. Not configurable. */
+export const RESULT_CAP = 30;
 
-/** Texto con que el servidor avisa que recortó los resultados. */
-export const AVISO_TOPE = 'muitos processos';
+/** Text the server uses to warn that it truncated the results. */
+export const CAP_WARNING = 'muitos processos';
 
 /**
- * Busca en el HTML el id real del componente de búsqueda.
+ * Finds the real id of the search component in the markup.
  *
- * Preferir esto a la constante: sobrevive a un redespliegue del tribunal.
- * Devuelve `undefined` si no lo encuentra, y en ese caso el llamador decide si
- * usar el valor conocido o abortar.
+ * Preferred over the constant: it survives a redeploy by the court. Returns
+ * `undefined` when not found, leaving the caller to decide between the known
+ * value and aborting.
  */
-export function descubrirIdBusqueda(html: string): string | undefined {
+export function discoverSearchComponentId(html: string): string | undefined {
   // executarPesquisa=function(){A4J.AJAX.Submit('fPP',null,{... 'parameters':{'fPP:j_id244':'fPP:j_id244'} ...
-  const bloque = /executarPesquisa\s*=\s*function[\s\S]{0,600}?'parameters'\s*:\s*\{\s*'([^']+)'/.exec(
+  const match = /executarPesquisa\s*=\s*function[\s\S]{0,600}?'parameters'\s*:\s*\{\s*'([^']+)'/.exec(
     html,
   );
-  return bloque?.[1];
+  return match?.[1];
 }
