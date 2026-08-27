@@ -182,12 +182,27 @@ in bulk: the redirect has to be followed there and then, with the session alive.
 
 ---
 
-## 8. The site responds in ISO-8859-1
+## 8. The site's encoding is not uniform
 
-Not UTF-8. Decoded with the default, accents corrupt ("APELAÇÃO" becomes
-"APELAÃÃO"). Affects both the extracted data and the PDF filenames.
+Initially the page was found to answer in ISO-8859-1 rather than UTF-8: decoded
+with the default, accents corrupt ("APELAÇÃO" becomes "APELAÃÃO").
 
-**Status:** identified — handled in ISSUE-2.
+**But the site does not use a single encoding.** Inspecting the raw bytes showed:
+
+| Request | Actual encoding | Declares charset? |
+|---|---|---|
+| Page load (GET) | ISO-8859-1 | no |
+| AJAX response (POST) | **UTF-8** | no |
+
+Since search replies over AJAX, assuming latin-1 throughout would have corrupted
+**every** extracted field.
+
+**Resolution:** decide from the bytes, not the header (which never comes). UTF-8 is
+attempted first; if the result contains the replacement character, the bytes were not
+valid UTF-8 and latin-1 is used. Accented latin-1 text is almost never valid UTF-8 by
+accident, so the distinction is reliable.
+
+Implemented in `decodeByBytes()` (`src/http/client.ts`), with tests covering both.
 
 ---
 

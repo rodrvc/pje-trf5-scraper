@@ -21,10 +21,27 @@ import {
 } from './backoff.js';
 
 /**
- * The site responds in ISO-8859-1. Decoding it as UTF-8 corrupts the accents
- * ("APELAÇÃO" becomes "APELAÃÃO"), so it is converted explicitly.
+ * The site does **not** use a single encoding: full page loads arrive as
+ * ISO-8859-1, while the AJAX responses to POSTs arrive as UTF-8. Neither
+ * declares a `charset` in the body, so the header cannot be trusted.
+ *
+ * The decision is made from the bytes: UTF-8 has a validatable structure, and
+ * accented latin-1 text is almost never valid UTF-8 by accident. If it decodes
+ * as UTF-8, it is UTF-8; otherwise it is latin-1.
+ *
+ * Getting this wrong corrupts every extracted field: "APELAÇÃO" becomes
+ * "APELAÃÃO".
  */
-const SITE_ENCODING = 'latin1';
+function decodeByBytes(buffer: Buffer): string {
+  const asUtf8 = buffer.toString('utf8');
+
+  // The replacement character shows up when the bytes are not valid UTF-8.
+  if (!asUtf8.includes('�')) {
+    return asUtf8;
+  }
+
+  return iconv.decode(buffer, 'latin1');
+}
 
 export interface HttpClientOptions {
   /** Minimum wait between requests, in ms. Keeps load off the server. */
@@ -162,7 +179,7 @@ export class HttpClient {
     }
 
     return {
-      html: iconv.decode(Buffer.from(response.data as ArrayBuffer), SITE_ENCODING),
+      html: decodeByBytes(Buffer.from(response.data as ArrayBuffer)),
       status: response.status,
       url: response.request?.res?.responseUrl ?? originalUrl,
       headers,
