@@ -1,7 +1,7 @@
 ---
 id: ISSUE-2
 titulo: Cliente HTTP (sesión, encoding, reintentos)
-estado: todo
+estado: hecho
 ---
 
 ## Objetivo
@@ -52,4 +52,45 @@ sea posible, en vez de hardcodearlos dispersos.
 
 ## Resolución
 
-_(pendiente)_
+Implementado en tres piezas, con el transporte separado del protocolo:
+
+**`src/http/backoff.ts`** — cálculo puro de la espera. Se separó del cliente
+justamente para poder probarlo exhaustivamente sin red: es lo que hace
+demostrable el manejo de 429 sin castigar el sitio real.
+`parseRetryAfter()` entiende los dos formatos de la cabecera (segundos y fecha
+HTTP) y nunca devuelve negativo. El jitter evita que varias peticiones que
+fallan a la vez reintenten sincronizadas.
+
+**`src/http/client.ts`** — transporte puro, no sabe qué es JSF:
+- cookie jar (tough-cookie) y redirects, necesarios para los PDFs
+- decodificación explícita de ISO-8859-1 con iconv-lite
+- **concurrencia 1** vía cola interna, más delay configurable entre peticiones
+- reintentos ante 429/502/503/504 y errores de red transitorios
+- `Retry-After` del servidor con prioridad sobre el backoff propio, pero
+  acotado al techo para que un valor desmedido no cuelgue la ejecución
+- circuit breaker: ante N 429 seguidos aborta en vez de insistir
+
+**`src/pje/session.ts`** — protocolo JSF encima del cliente:
+- ViewState **por vista** (`Map<Vista, string>`), porque el del detalle es
+  distinto al de la búsqueda
+- detección de sesión caída: el PJe no responde 401/403 sino 200 con el
+  formulario vacío, así que se reconoce por contenido. Al detectarla,
+  reestablece sesión y reintenta **una sola vez** (si vuelve a caer el problema
+  es otro y conviene que se propague en vez de entrar en bucle)
+- las respuestas AJAX parciales se juzgan por otro criterio que las cargas
+  completas: solo cuentan como caída si además perdieron el ViewState
+
+**`src/pje/constants.ts`** — ids de JSF centralizados. Son autogenerados y
+cambian si el tribunal redespliega, así que además de la constante hay un
+`descubrirIdBusqueda()` que los deriva del HTML en runtime.
+
+### Verificación
+
+`npm test`: **30 tests en verde**, sin red (nock). Cubren backoff exponencial,
+ambos formatos de `Retry-After`, agotamiento de reintentos, circuit breaker y
+su reinicio, decodificación latin-1, redirect de descarga, ritmo entre
+peticiones y serialización de concurrentes.
+
+Smoke test contra el sitio real: sesión abierta (200), ViewState capturado,
+acentos correctos, y `descubrirIdBusqueda()` derivó `fPP:j_id244` del HTML por
+sí solo, coincidiendo con la constante. El reCAPTCHA sigue desactivado.
