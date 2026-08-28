@@ -22,7 +22,9 @@ splitting cascades across **three dimensions**:
 2. **Judicial class**: when a single day still saturates, split that day by
    class. Verified: 2025-03-11 caps at 30 but drops to 19 under class 202
 3. **Party-name tokens**: when day + class still saturates, sweep the
-   "Nome da parte" field, which is a substring filter (see below)
+   "Nome da parte" field — **split out into ISSUE-4b**, because it is a cover
+   rather than a partition and terminates on measured evidence, not by
+   construction
 
 Design it as an interchangeable strategy, not nested `if`s:
 
@@ -31,45 +33,14 @@ Design it as an interchangeable strategy, not nested `if`s:
       split(q: Query): Query[];
     }
 
-with `DateRangeSplit`, `JudicialClassSplit` and `PartyTokenSweep`, chained: when
-one runs out, the next takes over.
+with `DateRangeSplit` and `JudicialClassSplit` here, chained so that when one
+runs out the next takes over. The chain must accept a third link without being
+rewritten: ISSUE-4b plugs `PartyTokenSweep` into it.
 
-### The third dimension is a cover, not a partition
-
-`Nome da parte` is a `LIKE %token% AND LIKE %token%` substring match: order
-independent, matching mid-word, and its "at least two names" validation only
-counts whitespace-separated tokens — **single-character tokens pass** (`A A`,
-`DA S`, `E S` all run). Full evidence in `PROBLEMS.md` §5.
-
-This matters for the design: the resulting subsets **overlap**, so the two
-strategies above and this one are not interchangeable in kind.
-
-- `DateRangeSplit` / `JudicialClassSplit` produce **disjoint** subqueries whose
-  union is the parent by construction. Recursion terminates when none caps.
-- `PartyTokenSweep` produces **overlapping** subqueries with no completeness
-  guarantee. Termination is empirical: keep adding filters while the deduplicated
-  union keeps growing, stop when it plateaus.
-
-Measured on four saturating leaves, unioning nine crude filters:
-
-| Leaf | Unfiltered | Union |
-|---|---|---|
-| 2025-03-12 + class 202 | 30 | 42 |
-| 2025-03-11 + class 202 | 30 | 41 |
-| 2025-03-14 + class 202 | 30 | 37 |
-| 2025-03-19 + class 202 | 30 | 33 |
-
-The yield varies, which is why the stop condition must be "the union stopped
-growing", not a fixed probe count.
-
-Two consequences for the implementation:
-
-- **The sweep only runs on leaves that saturate** (~1 in 8 day+class leaves), so
-  its cost stays bounded even though each sweep is several requests.
-- **Completeness becomes measured, not proved.** A leaf where the union plateaued
-  is reported as covered-with-evidence (filters tried, union size, last CNJ seen);
-  one still growing when the budget ran out goes to `data/uncoverable.ndjson`
-  rather than being silently called complete.
+Both strategies in this issue produce **disjoint** subqueries whose union is the
+parent by construction, so recursion terminates when none caps and completeness
+is proved rather than measured. ISSUE-4b is deliberately not like that, which is
+why it is a separate issue.
 
 ### Ordering is by CNJ ascending
 
@@ -96,11 +67,9 @@ indices, so there is no offset to exploit.
 
 - A broad range splits itself until no query caps.
 - A saturating day is split by judicial class rather than recorded as lost.
-- A saturating day+class is swept by party token rather than recorded as lost,
-  and yields more than 30 cases where the unfiltered leaf yielded exactly 30.
 - No cases are lost to silent truncation.
-- A leaf abandoned before its union plateaued is written to
-  `data/uncoverable.ndjson` with the evidence, never counted as complete.
+- A day+class leaf that still saturates is handed to the next strategy in the
+  chain rather than silently accepted as complete (ISSUE-4b implements it).
 - Covered windows are recorded so runs can resume (ISSUE-7).
 
 ## Resolution

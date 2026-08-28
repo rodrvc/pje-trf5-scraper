@@ -15,6 +15,7 @@ Board status:
 | [ISSUE-2](ISSUE-2-http-client.md) | HTTP client (session, encoding, 429) | done |
 | [ISSUE-3](ISSUE-3-search.md) | Case search | done |
 | [ISSUE-4](ISSUE-4-date-sweep.md) | Date-window sweep | todo |
+| [ISSUE-4b](ISSUE-4b-party-sweep.md) | Party-token sweep | todo |
 | [ISSUE-5](ISSUE-5-case-detail.md) | Case detail | todo |
 | [ISSUE-6](ISSUE-6-pdfs.md) | PDF downloads | todo |
 | [ISSUE-7](ISSUE-7-persistence.md) | Persistence and resuming | todo |
