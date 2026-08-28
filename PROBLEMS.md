@@ -124,10 +124,82 @@ cap ever arrived without a warning, the alternative is losing cases silently.
 
 ### Approaches ruled out
 
-The "Processo" and "Processo referência" fields **do not accept partial matches**:
-passing `8100` (an originating-court code) returns exactly the same results as no
-filter at all. They are silently ignored and only serve exact lookups, so they cannot
-be used for partitioning.
+The "Processo" and "Processo referência" fields **do not accept partial matches**.
+A partial value returns **zero rows**: the filter is applied, it simply requires the
+full number. Probed on 2025-03-12 + class 202 (30 rows unfiltered):
+
+| Field | Value | Rows |
+|---|---|---|
+| Processo | `0803` | 0 |
+| Processo | `08001` | 0 |
+| Processo | `8100` | 0 |
+| Processo referência | `0803` | 0 |
+| Processo referência | `%` | 0 |
+
+The "Livre" radio next to "Processo referência" does not change this: it only unmasks
+the input client-side (`mascaraDocumento(..., 'LIV')`), the server still demands an
+exact number. So neither field can partition.
+
+### The result ordering, and why it matters
+
+The results come back **ordered by CNJ number ascending**, strictly monotonic across
+all 30 rows. The row ids in the markup (`fPP:processosTable:36263:j_id255`) are
+**entity keys, not indices** — they are neither sequential nor ascending — so there is
+no offset to manipulate.
+
+That means the query is effectively `ORDER BY <case number> ASC LIMIT 30`: the 30 rows
+shown are always the lexicographically smallest, and everything truncated sits *above*
+the last row displayed. Useful because the last row tells you exactly where the cut
+fell.
+
+### The third dimension: party name is a substring filter
+
+**The saturating leaf (one day + one class) is not the bottom of the tree.** The
+"Nome da parte" field is not an exact-name lookup: it is a
+`LIKE %token% AND LIKE %token%` substring match, order-independent and matching
+mid-word. The only guard is the "at least two names" validation, which merely counts
+whitespace-separated tokens — **and the tokens may be a single character each**.
+
+Verified on 2025-03-12 + class 202:
+
+| Party filter | Rows | Capped? | Last row |
+|---|---|---|---|
+| _(none)_ | 30 | yes | `0803807-42.2025.4.05.0000` |
+| `DA S` | 12 | no | `0804720-53.2025.4.05.8300` |
+| `DE A` | 30 | yes | `0803845-54.2025.4.05.0000` |
+| `A A` | 30 | yes | `0803818-71.2025.4.05.0000` |
+| `E S` | 30 | yes | `0803825-63.2025.4.05.0000` |
+| `ILV OS` | 1 | no | matches a "…sILVa…santOS…" party |
+| `XX YY` | 0 | no | — |
+
+Several of those last rows are **beyond** the unfiltered cap of `0803807-42`, which is
+the point: the filter reaches cases the unfiltered query cannot show.
+
+Unioning nine crude party filters over a saturating leaf and deduplicating by CNJ:
+
+| Leaf | Unfiltered | Union of 9 filters |
+|---|---|---|
+| 2025-03-12 + class 202 | 30 | **42** |
+| 2025-03-11 + class 202 | 30 | **41** |
+| 2025-03-14 + class 202 | 30 | **37** |
+| 2025-03-19 + class 202 | 30 | **33** |
+
+So the corpus **is** reachable past the cap. The yield varies (33 to 42 from the same
+nine filters), which is why termination must be driven by the union ceasing to grow
+rather than by a fixed number of probes. Note this axis is a **cover, not a
+partition**: the subsets overlap, so termination comes from the union ceasing to grow,
+not from disjointness. Deduplication by CNJ (already required) absorbs the overlap.
+
+### Correction: the cap warning was never observed to be absent
+
+An earlier note recorded a leaf returning 30 rows *without* the truncation warning.
+**That could not be reproduced.** Re-probed across six saturating leaves
+(2025-03-11, 12, 13, 14, 18, 19, all with class 202): every one returned 30 rows
+**with** the warning present.
+
+The defensive condition `rows >= 30 || warning present` stays, because a silent cap
+would create exactly the gap it guards against — but it is a precaution, not a
+response to observed behaviour.
 
 ---
 
