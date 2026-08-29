@@ -139,10 +139,49 @@ in a leap year is 3 days and gets the extra day on the first half; the same
 range in a non-leap year is 2 days) to make sure the UTC epoch-day arithmetic
 does not silently misplace the boundary around calendar irregularities.
 
+### Correction: the walk went oldest-first, not "from the present backwards"
+
+Caught in review. `DateRangeSplit.split` originally returned `[earlier, later]`
+and the sweep simply consumed a strategy's subqueries in order, so the walk
+covered the oldest half of a range first - the opposite of the "walk from the
+present backwards" requirement, even though the doc comment claimed otherwise.
+
+Fixed at the point where the order is actually decided: `split()` now returns
+`[later, earlier]`, with the reasoning recorded in `DateRangeSplit`'s own doc
+comment rather than assumed by the caller. `sweep()`'s comment was corrected to
+say plainly that it does not reorder anything - it just consumes what `split()`
+hands it - so the "recent first" guarantee lives in exactly one place. Added
+`test/sweep.test.ts`, "covers the most recent day first, not the earliest,
+for a multi-day range", asserting directly on event order rather than only on
+which queries ran.
+
+### Correction: a capped window's rows were marked "seen"
+
+Also caught in review, and more consequential: the original `deduplicate()`
+call ran on every window's rows, including capped ones. Since a capped
+window's rows are a strict prefix of what its children will find (the site
+returns rows ordered by CNJ ascending, truncated - PROBLEMS.md §5), marking
+them "seen" at the capped event meant the children's later, genuine sighting
+of those same cases would look like duplicates and get silently dropped from
+every final event. That directly contradicted the issue's own framing: "a
+capped query is a signal to narrow, not a result."
+
+Fixed by only deduplicating (and registering into the `seen` set) at the two
+**final** event kinds - `window` with `capped: false`, and `unsplittable`. A
+capped window still carries its raw, undeduplicated rows for auditability, but
+`SweepEvent`'s doc comment now states plainly that those rows are informational
+only and must not be treated as part of the sweep's output. Added
+`test/sweep.test.ts`, "does not treat a capped window as final: its rows still
+reach the child final event", which fails under the old (buggy) behavior:
+without the fix, the child's identical rows would have been dropped as
+duplicates of the parent's. Also rewrote the pre-existing dedup test to
+dedupe only over final events, since counting a capped window's informational
+rows toward "the result" was the same category of mistake.
+
 ### Verification
 
-`npm test`: **78 tests green** (57 pre-existing + 16 in `test/partition.test.ts`
-+ 5 in `test/sweep.test.ts`), no network. `npm run typecheck`: clean.
+`npm test`: **80 tests green** (57 pre-existing + 16 in `test/partition.test.ts`
++ 7 in `test/sweep.test.ts`), no network. `npm run typecheck`: clean.
 
 ### Live smoke test
 
@@ -179,3 +218,21 @@ This also confirms the acceptance criteria empirically: the 5-day range did
 split itself until windows stopped capping, the saturating day was split by
 class rather than recorded as lost, and every window (capped or not) produced
 an event, so nothing here was silently truncated.
+
+### Known cost: class-splitting is expensive, and ISSUE-9 must budget for it
+
+`JudicialClassSplit` issues **one request per class in the catalog (132)** to
+fully resolve a single saturating day - confirmed live above, where the class
+fan-out for just one day (2025-03-11) consumed the rest of a 40-request budget
+without finishing. With roughly half of days saturating under the date axis
+alone (PROBLEMS.md §5: 6 of 13 probed days), a full month of history costs
+approximately:
+
+    ~30 days × 0.5 saturating × 132 requests/day  ≈  2,000 requests/month
+
+This is not a bug - it is what completeness costs on a site with no
+pagination - but it means an unbounded sweep over years of history is not
+something to run casually. ISSUE-9 (the sweep orchestrator) needs an explicit
+request budget and/or date-range limit for anything short of a full
+production run, and a demo run should default to a narrow range rather than
+the whole corpus.
