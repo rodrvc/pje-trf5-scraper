@@ -1,0 +1,22 @@
+<!--
+  Hand-minimised fixture: no case under segredo de justiça turned up among the
+  ~17 live candidates sampled while building ISSUE-5 (see its Resolution).
+
+  This is derived from the real detail markup structure (test/fixtures/
+  detail-with-pagination.html), trimmed to what the parser reads, with the
+  "Dados do Processo" heading and the parties/movements/documents panels
+  replaced by the restriction notice PJe uses elsewhere in the same
+  application for rejected queries (dl.rich-messages, see
+  parse-results.test.ts). The public TRF5 detail view was never observed
+  actually rendering this combination; it exercises isSealed() against the
+  documented failure mode (no "Dados do Processo" heading, no party/movement/
+  document tables) rather than a byte-for-byte capture.
+-->
+<html>
+<body>
+<div class="rich-tab-header rich-tab-active">Consulta Pública</div>
+<dl class="rich-messages">
+  <dd>Processo tramita em segredo de justiça. Não é possível exibir os dados.</dd>
+</dl>
+</body>
+</html>

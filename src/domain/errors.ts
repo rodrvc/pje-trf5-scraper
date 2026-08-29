@@ -79,3 +79,26 @@ export class DownloadError extends ScraperError {
  * back off.
  */
 export class CircuitBreakerError extends ScraperError {}
+
+/**
+ * The detail view GET returned a page that is neither an ordinary case detail
+ * nor a positively-identified sealed case (segredo de justiça).
+ *
+ * This covers whatever else the site can hand back: a database error page
+ * rendered as HTML with a 200 status, a dropped session that the `open()` GET
+ * does not otherwise detect (unlike `post()`, which retries once), a changed
+ * layout. None of these are the same domain state as a sealed case - treating
+ * them as "sealed" would silently persist a failure as if it were real data
+ * and never retry it. `reason` carries a short, human-readable excerpt of what
+ * actually came back, so the run log says what happened instead of just
+ * failing silently. Left for the orchestrator (ISSUE-9) to decide whether to
+ * retry or record as failed - that decision does not belong in the parser.
+ */
+export class UnexpectedDetailPageError extends ScraperError {
+  constructor(
+    message: string,
+    readonly reason: string,
+  ) {
+    super(message);
+  }
+}

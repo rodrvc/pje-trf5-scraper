@@ -26,11 +26,31 @@ export interface Movement {
 }
 
 /**
- * A document attached to the case.
+ * The identifiers a document's download link carries.
  *
- * All four identifiers are required by the download link and none can be derived
- * from the others, so they are all kept.
+ * All five are required to build the GET (ISSUE-6) and none can be derived
+ * from the others, so they travel together as one object rather than five
+ * loose fields on `CaseDocument`.
  */
+export interface DocumentDownloadRef {
+  idBin: string;
+  numeroDocumento: string;
+  /**
+   * File name the download link declares (e.g. "Inteiro Teor"). Used to build
+   * a descriptive local file name; `idProcessoDocumento` is what guarantees
+   * uniqueness, since this name is not guaranteed to be.
+   */
+  nomeArqProcDocBin: string;
+  idProcessoDocumento: string;
+  /**
+   * The JSF `actionMethod` the download link carries (URL-encoded EL
+   * expression naming the backing bean action). ISSUE-6 needs it verbatim to
+   * reproduce the GET.
+   */
+  actionMethod: string;
+}
+
+/** A document attached to the case. */
 export interface CaseDocument {
   /** ISO 8601 date. */
   date: string;
@@ -38,9 +58,8 @@ export interface CaseDocument {
   name: string;
   /** Type as declared by the system. */
   kind: string;
-  idBin: string;
-  numeroDocumento: string;
-  idProcessoDocumento: string;
+  /** Everything ISSUE-6 needs to build the download GET, as one object. */
+  download: DocumentDownloadRef;
   /** Local path of the PDF once downloaded. */
   localPath?: string;
 }
@@ -57,10 +76,19 @@ export interface LegalCase {
 
   judicialClass?: string;
   subject?: string;
-  /** Filing date (autuação) in ISO 8601. */
+  /**
+   * ISO 8601 date. Read from the header's "Data da Distribuição" (distribution
+   * date) field - the brief and PROBLEMS.md call this "autuação" (filing), but
+   * that is not the label the detail page itself uses. Kept as `filingDate`
+   * since that is the concept the rest of the scraper (the date-window sweep)
+   * queries by, but the actual source field is distribuição, not autuação.
+   */
   filingDate?: string;
   jurisdiction?: string;
+  /** Órgão Julgador Colegiado (the collegiate body), when the case has one. */
   court?: string;
+  /** Órgão Julgador (the judging body/chamber), when distinct from `court`. */
+  judgingBody?: string;
   address?: string;
   referenceCase?: string;
 
@@ -146,3 +174,4 @@ export interface JudicialClass {
   id: string;
   name: string;
 }
+
