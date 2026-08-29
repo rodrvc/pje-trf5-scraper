@@ -14,6 +14,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { HttpClient } from '../src/http/client.js';
 import { JsfSession, BASE_URL } from '../src/pje/session.js';
 import { PjeDetail } from '../src/pje/detail.js';
+import { UnexpectedDetailPageError } from '../src/domain/errors.js';
 
 const fixture = (name: string): string =>
   readFileSync(join(import.meta.dirname, 'fixtures', name), 'utf8');
@@ -168,6 +169,30 @@ describe('PjeDetail.fetch', () => {
     expect(result.movements).toEqual([]);
     expect(result.documents).toEqual([]);
     expect(result.ca).toBe('sealed1');
+    expect(nock.isDone()).toBe(true);
+  });
+
+  it('throws UnexpectedDetailPageError on a page that is neither ordinary nor sealed', async () => {
+    // This is the fix for the bug the review caught: a database error page
+    // (or a dropped session, or a changed layout) must not be silently
+    // recorded as a sealed case. It has to surface as a distinct failure so
+    // the orchestrator (ISSUE-9) can decide whether to retry.
+    const html = fixture('detail-server-error.html');
+
+    nock(BASE_URL).get(`${DETAIL_PATH}?ca=broken1`).reply(200, html);
+
+    const session = new JsfSession(fastClient());
+    const detail = new PjeDetail(session);
+
+    let error: unknown;
+    try {
+      await detail.fetch('broken1');
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(UnexpectedDetailPageError);
+    expect((error as UnexpectedDetailPageError).reason).toBe('database error page');
     expect(nock.isDone()).toBe(true);
   });
 

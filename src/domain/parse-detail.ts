@@ -75,18 +75,42 @@ export function decodeLatin1QueryValue(raw: string): string {
   return Buffer.from(bytes).toString('latin1');
 }
 
+/** How a detail-view GET response was classified. */
+export type DetailPageKind =
+  | { kind: 'sealed' }
+  | { kind: 'detail' }
+  | { kind: 'unexpected'; reason: string };
+
 /**
- * Detects a case under segredo de justiça.
+ * Classifies what a detail-view GET actually returned.
  *
- * The detail view for a sealed case still returns 200, but without the
- * "Dados do Processo" heading every ordinary detail page carries, and without
- * the parties/movements/documents panels. Treated as a domain state, not an
- * error: callers get `sealed: true` and every other field absent rather than
- * a thrown exception.
+ * Three-way on purpose, not a boolean: the only positive signal for a case
+ * under segredo de justiça is the site's own wording ("segredo de justiça" /
+ * "autos sigilosos"). The "Dados do Processo" heading being present is what
+ * marks an ordinary case. **Its absence alone is not enough to call a page
+ * sealed** — a database error page rendered as HTML, a dropped session that
+ * `session.open()`'s GET does not otherwise catch (unlike `post()`, which
+ * retries once on the same signal), or a changed layout all lack that heading
+ * too, and none of them is the same domain state as a real sealed case.
+ * Collapsing "unrecognised" into "sealed" would persist a failure as if it
+ * were real, sealed data, and it would never be retried.
+ *
+ * `unexpected` carries a short `reason` for the run log; the caller decides
+ * whether to throw, retry or record it as a failure (see
+ * `UnexpectedDetailPageError` in `src/domain/errors.ts`) — that decision does
+ * not belong in a pure parser.
  */
-export function isSealed(html: string): boolean {
-  if (/segredo de justi[çc]a|autos? sigiloso/i.test(html)) return true;
-  return !html.includes('Dados do Processo');
+export function classifyDetailPage(html: string): DetailPageKind {
+  if (/segredo de justi[çc]a|autos? sigiloso/i.test(html)) {
+    return { kind: 'sealed' };
+  }
+  if (html.includes('Dados do Processo')) {
+    return { kind: 'detail' };
+  }
+  if (/PSQLException|SQLException|Stacktrace completo/i.test(html)) {
+    return { kind: 'unexpected', reason: 'database error page' };
+  }
+  return { kind: 'unexpected', reason: 'no detail panel' };
 }
 
 /** Header fields shown in the "Dados do Processo" panel. */

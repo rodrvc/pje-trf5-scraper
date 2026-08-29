@@ -24,13 +24,14 @@
 
 import type { DatascrollerInfo, LegalCase } from '../domain/types.js';
 import {
-  isSealed,
+  classifyDetailPage,
   parseCaseHeader,
   parseDocuments,
   parseMovements,
   parseParties,
   parseScrollers,
 } from '../domain/parse-detail.js';
+import { UnexpectedDetailPageError } from '../domain/errors.js';
 import type { JsfSession } from './session.js';
 
 /** Ids of the three parties/movements tables the detail view paginates. */
@@ -45,13 +46,20 @@ export class PjeDetail {
    *
    * A sealed case returns immediately after the first GET: there is nothing
    * further to page through, and the missing sections are not an error.
+   *
+   * @throws UnexpectedDetailPageError when the page is neither an ordinary
+   *   detail view nor positively identified as sealed - a database error page
+   *   or a dropped session, for instance. Left to the orchestrator (ISSUE-9)
+   *   to decide whether to retry or record as a failure.
    */
   async fetch(ca: string): Promise<LegalCase> {
     const first = await this.session.open('detail', `?ca=${ca}`);
     const html = first.html;
     const extractedAt = new Date().toISOString();
 
-    if (isSealed(html)) {
+    const classification = classifyDetailPage(html);
+
+    if (classification.kind === 'sealed') {
       return {
         number: '',
         ca,
@@ -62,6 +70,14 @@ export class PjeDetail {
         sealed: true,
         extractedAt,
       };
+    }
+
+    if (classification.kind === 'unexpected') {
+      throw new UnexpectedDetailPageError(
+        `Detail page for ca="${ca}" was neither an ordinary case nor a sealed one: ` +
+          `${classification.reason}.`,
+        classification.reason,
+      );
     }
 
     const header = parseCaseHeader(html);

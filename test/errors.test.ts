@@ -6,6 +6,7 @@ import {
   RejectedQueryError,
   ScraperError,
   SessionExpiredError,
+  UnexpectedDetailPageError,
 } from '../src/domain/errors.js';
 
 describe('scraper errors', () => {
@@ -32,5 +33,11 @@ describe('scraper errors', () => {
 
   it('each error reports its own class name', () => {
     expect(new SessionExpiredError('x').name).toBe('SessionExpiredError');
+  });
+
+  it('UnexpectedDetailPageError keeps the reason so the run log says what came back', () => {
+    const error = new UnexpectedDetailPageError('unexpected page', 'database error page');
+    expect(error.reason).toBe('database error page');
+    expect(error).toBeInstanceOf(ScraperError);
   });
 });

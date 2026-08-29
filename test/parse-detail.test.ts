@@ -10,8 +10,8 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import {
+  classifyDetailPage,
   decodeLatin1QueryValue,
-  isSealed,
   parseCaseHeader,
   parseDocuments,
   parseMovements,
@@ -25,25 +25,43 @@ const fixture = (name: string): string =>
 const ACTIVE = 'j_id146:processoPartesPoloAtivoResumidoList';
 const PASSIVE = 'j_id146:processoPartesPoloPassivoResumidoList';
 
-describe('isSealed', () => {
-  it('is not sealed when "Dados do Processo" is present', () => {
-    expect(isSealed('<html>Dados do Processo</html>')).toBe(false);
+describe('classifyDetailPage', () => {
+  it('classifies an ordinary page by the "Dados do Processo" heading', () => {
+    expect(classifyDetailPage('<html>Dados do Processo</html>')).toEqual({ kind: 'detail' });
   });
 
-  it('is sealed when the heading is absent', () => {
-    expect(isSealed('<html>nothing here</html>')).toBe(true);
+  it('classifies the page as sealed only on the positive segredo/sigilo text', () => {
+    expect(classifyDetailPage('<html>Processo em segredo de justiça</html>')).toEqual({
+      kind: 'sealed',
+    });
+    expect(classifyDetailPage('<html>Autos sigilosos</html>')).toEqual({ kind: 'sealed' });
   });
 
-  it('is sealed when the page explicitly says segredo de justiça', () => {
-    expect(isSealed('<html>Processo em segredo de justiça</html>')).toBe(true);
+  it('does NOT call an unrecognised page sealed: it is "unexpected" instead', () => {
+    // This is the core fix: a page with neither the heading nor the sealed
+    // wording (a dropped session, a changed layout) must not be silently
+    // treated as valid sealed-case data.
+    expect(classifyDetailPage('<html>nothing recognisable here</html>')).toEqual({
+      kind: 'unexpected',
+      reason: 'no detail panel',
+    });
+  });
+
+  it('classifies a database error page as "unexpected", not sealed', () => {
+    // Real capture: case 0804011-36.2025.4.05.8100 returned this instead of
+    // the detail view. It lacks "Dados do Processo" just like a sealed case
+    // would, which is exactly why a second, independent signal is needed.
+    const classification = classifyDetailPage(fixture('detail-server-error.html'));
+
+    expect(classification).toEqual({ kind: 'unexpected', reason: 'database error page' });
   });
 
   it('reads the hand-derived sealed fixture as sealed', () => {
-    expect(isSealed(fixture('detail-sealed.html'))).toBe(true);
+    expect(classifyDetailPage(fixture('detail-sealed.html'))).toEqual({ kind: 'sealed' });
   });
 
-  it('reads a real ordinary detail page as not sealed', () => {
-    expect(isSealed(fixture('detail-with-pagination.html'))).toBe(false);
+  it('reads a real ordinary detail page as "detail"', () => {
+    expect(classifyDetailPage(fixture('detail-with-pagination.html'))).toEqual({ kind: 'detail' });
   });
 });
 

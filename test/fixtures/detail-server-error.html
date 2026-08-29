@@ -1,0 +1,30 @@
+<!--
+  Hand-derived fixture: reproduces a real PostgreSQL error page returned by
+  the live site for case 0804011-36.2025.4.05.8100 while sampling candidates
+  for a sealed-case fixture (see ISSUE-5's Resolution and PROBLEMS.md §6).
+  The exact wording below ("cannot execute UPDATE in a read-only transaction",
+  raised from ProcessoDocumentoBinHome) is quoted verbatim from that live
+  capture; surrounding boilerplate (styling, unrelated scripts) is trimmed,
+  since only the exception text matters to classifyDetailPage().
+
+  This is a genuine server bug, not a sealed case: it lacks "Dados do
+  Processo" just like a sealed page would, which is exactly why
+  classifyDetailPage() needs a second, independent signal (the exception
+  markers here) to tell the two apart instead of collapsing both into
+  "sealed".
+-->
+<html>
+<head><title> &middot; Tribunal Regional Federal da 5&ordf; Regi&atilde;o</title></head>
+<body>
+<h3>Exceptions:</h3>
+<p>
+Caused by org.postgresql.util.PSQLException with message: ERROR: cannot execute UPDATE in a read-only transaction
+Caused by javax.servlet.ServletException with message: /ConsultaPublica/DetalheProcessoConsultaPublica/listView.xhtml @112,268 rendered="#{!row.processoDocumento.processoDocumentoBin.binario and rendDocumento and row.processoDocumento.ativo and (not (!sessionScope.get('pje:papel:isUsuarioInterno') and processoDocumentoHome.existePendenciaCienciaSemCache(row.processoDocumento)))}": br.jus.cnj.pje.nucleo.PJeDAOException:
+</p>
+<h3>Stacktrace completo:</h3>
+<pre>
+org.postgresql.util.PSQLException: ERROR: cannot execute UPDATE in a read-only transaction
+	at br.jus.cnj.pje.consulta.processoDocumentoBinHome (truncated for the fixture)
+</pre>
+</body>
+</html>
