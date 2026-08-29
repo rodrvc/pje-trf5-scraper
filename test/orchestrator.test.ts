@@ -11,7 +11,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { CircuitBreakerError, ParseError, RejectedQueryError, UnexpectedDetailPageError } from '../src/domain/errors.js';
+import { CircuitBreakerError, ParseError, RateLimitError, RejectedQueryError, UnexpectedDetailPageError } from '../src/domain/errors.js';
 import type { CaseDocument, LegalCase, Query, SearchResponse, SearchResultRow } from '../src/domain/types.js';
 import { PersistenceStore } from '../src/persistence/store.js';
 import { DateRangeSplit, PartitionChain } from '../src/pipeline/partition.js';
@@ -190,6 +190,27 @@ describe('Scraper (orchestrator)', () => {
 
     expect(summary.casesFailed).toBe(1);
     expect(await store.listRetryableCases()).toMatchObject([{ caseNumber: 'case-bad', retryable: true }]);
+  });
+
+  it('policy: an unknown error from detail (e.g. RateLimitError exhausted) is recorded, not aborted, and the next row still runs', async () => {
+    const search = async (_query: Query): Promise<SearchResponse> =>
+      response([row('case-bad'), row('case-good')]);
+    const detail = fakeDetail({
+      'ca-case-bad': new RateLimitError('429 after 5 retries'),
+      'ca-case-good': legalCase('case-good'),
+    });
+    const downloader = fakeDownloader({});
+    const logger = recordingLogger();
+
+    const scraper = new Scraper({ search, detail, downloader, store, chain: noopChain(), logger });
+    const summary = await scraper.run(RANGE);
+
+    expect(summary.casesFailed).toBe(1);
+    expect(summary.casesDetailed).toBe(1);
+    expect(await store.listRetryableCases()).toMatchObject([
+      { caseNumber: 'case-bad', retryable: true, reason: expect.stringContaining('RateLimitError') },
+    ]);
+    expect(await store.hasCase('case-good')).toBe(true);
   });
 
   it('policy: RejectedQueryError from search is recorded as a sweep failure, run continues', async () => {

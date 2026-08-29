@@ -51,47 +51,49 @@ corner.
 
 | Failure | Action |
 |---|---|
-| `detail.fetch` throws `ParseError`/`UnexpectedDetailPageError` | `store.recordCaseFailure({ retryable: true })`, dequeue the row, continue with the next row |
+| `detail.fetch` throws anything except `CircuitBreakerError` (`ParseError`, `UnexpectedDetailPageError`, a `RateLimitError` that exhausted its retries, a raw network error, ...) | `store.recordCaseFailure({ retryable: true, reason: "<ErrorName>: <message>" })`, dequeue the row, continue with the next row |
 | `search` throws `RejectedQueryError` | logged through the sink as a sweep-level failure, run continues |
-| a document download returns `{ ok: false }` | `store.recordDocumentFailure(...)`, continue with the next document |
-| `CircuitBreakerError` (or anything else unhandled) | finish the persistence writes already in flight, then rethrow - the run aborts cleanly |
+| a document download returns `{ ok: false }`, or `downloader.download` itself throws anything except `CircuitBreakerError` | `store.recordDocumentFailure(...)`, continue with the next document |
+| `CircuitBreakerError`, from detail, download or the sweep | finish the persistence writes already in flight, then rethrow - the run aborts cleanly |
 
-The brief's "continue to the next document after several attempts" is
-exactly what `PjeDownloader`'s own retry/session-recovery already does
-before handing back `{ ok: false }`; this loop never retries a download
-itself, it only decides what to do once the downloader has given up. The
-circuit breaker is the line above that - "stop hammering the server" - which
-is why it is the one error kind the loop does not swallow.
+The brief's "continue with the next document/case if the error persists
+after several attempts" is exactly what `PjeDownloader`'s retry/session
+recovery and `HttpClient`'s own 429 retry loop already do before an error
+ever reaches this module - by the time `detail.fetch` or
+`downloader.download` throws, that retrying has already happened and given
+up, so this loop never retries either of them itself, it only decides what
+to do once they have given up. Only `CircuitBreakerError` overrides
+"continue" with "stop hammering the server altogether" - a review pass
+caught an earlier version of this policy conflating "unknown error" with
+"unrecoverable", which would have aborted the whole run on an ordinary
+exhausted retry.
 
-**Tests**: `test/orchestrator.test.ts`, 8 tests with scripted fakes for
+**Tests**: `test/orchestrator.test.ts`, 9 tests with scripted fakes for
 `search`/`detail`/`downloader` and a real temp-dir `PersistenceStore` (same
 style as `test/persistence-store.test.ts`): the happy path (persists the
 case, then re-persists with `localPath`s filled in), a row already in the
 case index being dequeued without a detail fetch, one test per row of the
-policy table above, and the summary counts. `npm test`: 215/215 green.
-`npm run typecheck`: clean.
+policy table above (including a `RateLimitError` from `detail.fetch` being
+recorded as a retryable case failure while the next row still gets
+detailed), and the summary counts. `npm test`: 216/216 green. `npm run
+typecheck`: clean.
 
-**Live smoke** (`scripts/smoke-orchestrator.ts`, kept as a committed,
-re-runnable tool, same posture as `scripts/smoke-download.ts`): a real run
-of the whole loop against `from = to = 2025-03-05` (10 cases, no class
-split needed - the day did not saturate). Documents were downloaded for real
-only for the first case detailed, to keep the live request count small; every
-other case still got a real detail fetch, so the loop itself was exercised
-end to end, not just the search.
+**Live smoke**: run once during development against `from = to = 2025-03-05`
+(10 cases, no class split needed - the day did not saturate), downloading
+documents for real only for the first case detailed to keep the live request
+count small, while every other case still got a real detail fetch so the
+loop itself was exercised end to end, not just the search.
 
-Results:
+Results: 1 window, 10 cases listed, 9 detailed, 1 failed (a genuine live
+`UnexpectedDetailPageError` - a database error page from the real site -
+recorded via `recordCaseFailure`, exercising that policy row against the
+real site rather than a fake); 3 documents downloaded, 33 skipped by the
+run's own cap, 0 failed; 0 retries observed. `data/`/`pdfs/` used temp
+directories, removed afterwards, and are gitignored regardless.
 
-- 1 window, 10 cases listed, 9 detailed, 1 failed
-- 1 case genuinely hit `UnexpectedDetailPageError` live (a database error
-  page from the real site) and was recorded via `recordCaseFailure`,
-  exercising that policy row against the real site rather than a fake
-- 3 documents downloaded (the capped case), 33 skipped by the smoke script's
-  own cap, 0 failed
-- 0 retries observed (no 429s during the run)
-
-`data/` and `pdfs/` are written to temp directories by the smoke script and
-removed in a `finally` block; both are also gitignored, verified with
-`git status` after the run - nothing leaked into the working tree.
+The smoke script itself (`scripts/smoke-orchestrator.ts`) is not part of this
+PR - moved out during review to stay within the diff-size target - and will
+land with 9c, which does the equivalent demo run for budgets/limits.
 
 **Deferred to 9b**: resume across runs (skipping already-covered windows via
 `isCovered`, retrying previously-failed cases/documents via

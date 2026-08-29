@@ -17,24 +17,27 @@
  *
  * | Failure                                          | Action                                          |
  * |---------------------------------------------------|--------------------------------------------------|
- * | `detail.fetch` throws `ParseError`/`UnexpectedDetailPageError` | `store.recordCaseFailure({ retryable: true })`, dequeue the row, continue with the next row |
+ * | `detail.fetch` throws anything **except** `CircuitBreakerError` (`ParseError`, `UnexpectedDetailPageError`, a `RateLimitError` that exhausted its retries, a raw network error, ...) | `store.recordCaseFailure({ retryable: true, reason: "<ErrorName>: <message>" })`, dequeue the row, continue with the next row |
  * | `search` throws `RejectedQueryError` (surfaced as a sweep-level failure) | logged through the sink as a sweep failure, continue the run |
- * | a document download fails (`DownloadResult` with `ok: false`)  | `store.recordDocumentFailure(...)`, continue with the next document |
- * | `CircuitBreakerError` or any other error out of the sweep/detail/download loop | finish the writes already in flight for the current row, then rethrow - abort the run cleanly |
+ * | a document download fails - `DownloadResult` with `ok: false`, or `downloader.download` itself throwing anything **except** `CircuitBreakerError` | `store.recordDocumentFailure(...)`, continue with the next document |
+ * | `CircuitBreakerError`, from detail, download or the sweep | finish the writes already in flight for the current row, then rethrow - abort the run cleanly |
  *
- * The brief's "continue to the next document if the error persists after
- * several attempts" is exactly what `PjeDownloader`'s own retry/session
- * recovery already does before returning `{ ok: false }` - this module never
- * retries a download itself, it only decides what to do once the downloader
- * has given up. The circuit breaker is the line above that: "stop hammering
- * the server altogether", which is why it is the one error kind this loop
- * does not swallow.
+ * The brief's "continue with the next document/case if the error persists
+ * after several attempts" is exactly what `PjeDownloader`'s own retry/session
+ * recovery, and `HttpClient`'s own 429 retry loop, already do before an error
+ * ever reaches this module: by the time `detail.fetch` or `downloader.download`
+ * throws, that retrying has already happened and given up. This module never
+ * retries either of them itself - it only decides what to do once they have.
+ * The circuit breaker is the one exception, at every one of those call sites:
+ * "stop hammering the server altogether" overrides "continue on this row",
+ * which is why it is the only error kind this loop does not turn into a
+ * recorded, continued-past failure.
  */
 
-import type { LegalCase, Query, SearchResultRow } from '../domain/types.js';
-import { CircuitBreakerError, ParseError, RejectedQueryError, UnexpectedDetailPageError } from '../domain/errors.js';
+import type { CaseDocument, LegalCase, Query, SearchResultRow } from '../domain/types.js';
+import { CircuitBreakerError, RejectedQueryError } from '../domain/errors.js';
 import type { PjeDetail } from '../pje/detail.js';
-import type { PjeDownloader } from '../pje/download.js';
+import type { DownloadResult, PjeDownloader } from '../pje/download.js';
 import type { PersistenceStore } from '../persistence/store.js';
 import { isFinalSweepEvent } from '../persistence/store.js';
 import { sweep, type CoverFn, type SeenSet, type SearchFn, type SweepEvent } from './sweep.js';
@@ -204,22 +207,27 @@ export class Scraper {
     try {
       legalCase = await this.detail.fetch(row.ca, row.number);
     } catch (error) {
-      if (error instanceof ParseError || error instanceof UnexpectedDetailPageError) {
-        const reason = error.message;
-        await this.store.recordCaseFailure({
-          caseNumber: row.number,
-          ca: row.ca,
-          reason,
-          attempt: 1,
-          retryable: true,
-        });
-        await this.store.dequeueRow(row.number);
-        summary.casesFailed += 1;
-        this.logger.log({ kind: 'case-failed', number: row.number, reason });
-        return;
+      // Only the circuit breaker aborts the run - see the module comment's
+      // policy table. Everything else (ParseError, UnexpectedDetailPageError,
+      // a RateLimitError that exhausted HttpClient's own retries, a raw
+      // network error) is "the error persisted after several attempts": it
+      // is this row's problem, not the run's, so it is recorded and the walk
+      // continues to the next one.
+      if (error instanceof CircuitBreakerError) {
+        throw error;
       }
-      // CircuitBreakerError or anything unrecoverable: abort the run.
-      throw error;
+      const reason = describeError(error);
+      await this.store.recordCaseFailure({
+        caseNumber: row.number,
+        ca: row.ca,
+        reason,
+        attempt: 1,
+        retryable: true,
+      });
+      await this.store.dequeueRow(row.number);
+      summary.casesFailed += 1;
+      this.logger.log({ kind: 'case-failed', number: row.number, reason });
+      return;
     }
 
     await this.store.completeRow(legalCase);
@@ -233,10 +241,27 @@ export class Scraper {
     await this.store.completeRow(legalCase);
   }
 
+  /**
+   * Calls `downloader.download`, turning a thrown error into a failed
+   * `DownloadResult` instead of letting it escape - `PjeDownloader.download`
+   * never throws for HTTP-level failures by contract (see that module), but
+   * a thrown filesystem error (a full disk, a permissions problem) must fail
+   * this one document, not the run, same as every other detail/download
+   * failure. Only `CircuitBreakerError` is left to propagate and abort.
+   */
+  private async attemptDownload(legalCase: LegalCase, doc: CaseDocument): Promise<DownloadResult> {
+    try {
+      return await this.downloader.download(legalCase.number, doc, legalCase.ca);
+    } catch (error) {
+      if (error instanceof CircuitBreakerError) throw error;
+      return { ok: false, reason: describeError(error), retryable: true, sessionAttempts: 1 };
+    }
+  }
+
   /** Downloads every document of one case, recording each outcome. */
   private async downloadDocuments(legalCase: LegalCase, summary: RunSummary): Promise<void> {
     for (const doc of legalCase.documents) {
-      const result = await this.downloader.download(legalCase.number, doc, legalCase.ca);
+      const result = await this.attemptDownload(legalCase, doc);
 
       if (result.ok) {
         doc.localPath = result.path;
@@ -275,7 +300,8 @@ export class Scraper {
   }
 }
 
+/** `"ErrorName: message"`, so a recorded failure's reason names the error kind, not just its text. */
 function describeError(error: unknown): string {
-  if (error instanceof CircuitBreakerError) return `circuit breaker: ${error.message}`;
-  return error instanceof Error ? error.message : String(error);
+  if (error instanceof Error) return `${error.name}: ${error.message}`;
+  return String(error);
 }
