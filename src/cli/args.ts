@@ -48,13 +48,13 @@ Options:
   --max-requests=N      Stop after N network requests (default: ${DEFAULT_MAX_REQUESTS})
   --max-cases=N         Stop after N cases detailed (default: ${DEFAULT_MAX_CASES})
   --delay-ms=N          Minimum delay between requests (default: ${DEFAULT_DELAY_MS}, min: ${MIN_DELAY_MS})
-  --retry-failed         Re-attempt previously failed cases/documents instead of a fresh sweep
-  --data-dir=PATH        Where case/progress data is written (default: data)
-  --pdf-dir=PATH         Where downloaded PDFs are written (default: pdfs)
-  --unbounded             Run with no request/case budget at all - a long-running
-                           full run, not the bounded demo. Use with care: this is
-                           a real court's server.
-  -h, --help              Show this help and exit
+  --retry-failed        Re-attempt previously failed cases/documents instead of a fresh sweep
+  --data-dir=PATH       Where case/progress data is written (default: data)
+  --pdf-dir=PATH        Where downloaded PDFs are written (default: pdfs)
+  --unbounded           Run with no request/case budget at all - a long-running
+                        full run, not the bounded demo. Use with care: this is
+                        a real court's server.
+  -h, --help            Show this help and exit
 
 Examples:
   npm run scrape -- --from=2025-03-05 --to=2025-03-05 --max-cases=1
