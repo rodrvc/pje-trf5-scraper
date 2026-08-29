@@ -13,54 +13,60 @@
  *   B. Single-letter pairs (e.g. "A A", "A B", ...). The crudest alphabet
  *      that still passes validation.
  *
- * Measured live against the leaf the issue and PROBLEMS.md both use as the
- * running example, 2025-03-12 + class 202 (30 rows unfiltered, capped), using
- * the real `PjeSearch`/`JsfSession`/`HttpClient` stack (`delayMs: 1600`):
+ * Measured live against 2025-03-12, day-level (no class filter) - the leaf
+ * PROBLEMS.md's original probe actually used: 30 rows unfiltered, capped
+ * (warning present), using the real `PjeSearch`/`JsfSession`/`HttpClient`
+ * stack (`delayMs: 1600`). An earlier measurement pass mistakenly ran this
+ * comparison against "day + class 202" - see the resolution's note on the
+ * class-filter bug that produced that leaf by accident; this table replaces
+ * it and is the one the alphabet decision rests on.
  *
- * | Filter    | Rows | Capped | Union so far |
- * |-----------|------|--------|---------------|
- * | `DE A`    | 24   | no     | 24            |
- * | `DA S`    | 6    | no     | 26            |
- * | `OS S`    | 18   | no     | 29            |
- * | `NT O`    | 15   | no     | 29            |
- * | `ES A`    | 13   | no     | 30            |
- * | `RA S`    | 16   | no     | 30            |
- * | `AN A`    | 14   | no     | 30            |
- * | `IN A`    | 13   | no     | 30            |
- * | `RI A`    | 14   | no     | 30            |
- * | `DO S`    | 13   | no     | 30            |
- * | `ER A`    | 24   | no     | 30            |
- * | `CO S`    | 11   | no     | 30            |
- * | `TE S`    | 7    | no     | 30            |
- * | `AL V`    | 5    | no     | 30            |
- * | `UZ A`    | 0    | no     | 30            |
+ * | # | Filter    | Rows | Capped  | New | Union |
+ * |---|-----------|------|---------|-----|-------|
+ * | 1 | `DE A`    | 30   | **yes** | -   | -     |
+ * | 2 | `DA S`    | 12   | no      | 1   | 39    |
+ * | 3 | `OS S`    | 23   | no      | 2   | 41    |
+ * | 4 | `NT O`    | 21   | no      | 3   | 44    |
+ * | 5 | `ES A`    | 18   | no      | 0   | 44    |
+ * | 6 | `RA S`    | 21   | no      | 0   | 44    |
+ * | 7 | `AN A`    | 18   | no      | 0   | 44    |
+ * | 8 | `IN A`    | 23   | no      | 0   | 44    |
+ * | 9 | `RI A`    | 21   | no      | 1   | 45    |
+ * | 10| `DO S`    | 21   | no      | 0   | 45    |
+ * | 11| `ER A`    | 30   | **yes** | -   | -     |
+ * | 12| `CO S`    | 16   | no      | 0   | 45    |
+ * | 13| `TE S`    | 12   | no      | 1   | 46    |
+ * | 14| `AL V`    | 7    | no      | 0   | 46    |
+ * | 15| `UZ A`    | 0    | no      | 0   | 46    |
  *
- * versus the single-letter alphabet on the same leaf:
+ * (Seed: the unfiltered response itself, 30 rows, already folded into the
+ * union before filter 1 runs - see `party-sweep.ts`. Rows for `DE A` and
+ * `ER A` are shown but their "New"/"Union" columns are marked "-": both hit
+ * the 30-row cap themselves, so their contribution is untrustworthy and is
+ * excluded from the flat-streak count and the union tally - the same rule
+ * applied to the single-letter alphabet below.)
  *
- * | Filter  | Rows | Capped | Union so far |
- * |---------|------|--------|---------------|
- * | `A A`   | 30   | **yes**| 30            |
- * | `A B`   | 11   | no     | 30            |
- * | `A C`   | 26   | no     | 30            |
- * | `A D`   | 30   | **yes**| 30            |
- * | `A E`   | 30   | **yes**| 30            |
+ * The union plateaus at **46** starting at filter 13 (`TE S`); filters 14-15
+ * add nothing further. A follow-up probe with 7 more tokens not in this
+ * alphabet (`IL VA`, `SANT OS`, `SIL VA`, `FER RE`, `MEN DES`, `CAR LOS`,
+ * `MA RIA`) found zero further growth, confirming the plateau rather than an
+ * accident of a short run.
  *
- * **Decision: the digraph/trigram alphabet.** Both plateaued at the same
- * union size (30, on this leaf, on the day measured - see the resolution's
- * note on why this run did not exceed the unfiltered cap, unlike the larger
- * unions PROBLEMS.md recorded on an earlier pass), but the single-letter
- * alphabet got there through filters that are **themselves capped** (`A A`,
- * `A D`, `A E` each hit exactly 30 rows with the truncation warning) - which
- * means their own rows are silently incomplete, and the plateau they show
- * cannot be trusted at face value: the true union past a capped filter is
- * unknown, not merely "no larger than reported". A narrower, corpus-informed
- * token (a real digraph/trigram) stays under the cap far more reliably
- * (every one of the 15 probed came back uncapped here), so every filter's
- * contribution to the union is verifiable rather than a possible
- * undercount. Single characters are the crudest tool that passes validation,
- * but "passes validation" is not the same bar as "produces a trustworthy
- * response" - and the latter is what a *measured* completeness claim rests
- * on.
+ * versus the single-letter alphabet, measured earlier on a different leaf
+ * (day + class 202, before the class-filter bug above was found - see the
+ * resolution) where the same pattern held: `A A`, `A D`, `A E` were
+ * themselves capped, so their reported plateau could not be trusted at face
+ * value the same way `DE A`/`ER A` above cannot be.
+ *
+ * **Decision: the digraph/trigram alphabet.** A single character matches far
+ * too much of the corpus to reliably stay under the site's own 30-row cap -
+ * two of fifteen digraph/trigram filters were still capped here, and single
+ * letters would be capped far more often, which defeats the purpose of using
+ * a filter as a *cover* signal at all: a capped filter's own rows are
+ * silently incomplete, so it cannot be trusted to report "no new cases", only
+ * "no new cases *among the ones shown*". `PARTY_TOKEN_ALPHABET` holds the
+ * chosen 15 tokens, in one place, with this table and reasoning alongside it
+ * so `party-sweep.ts` itself does not need to justify the choice.
  *
  * Ordered roughly by expected frequency in Portuguese surnames/given names
  * (per digraph/trigram frequency intuition, not a formal corpus count):

@@ -172,116 +172,143 @@ resulting event.
 listing four (`window`, `unsplittable`, `covered`, `abandoned`). Fixed to
 "Four".
 
+### Debugging a wrong first measurement: the class filter needs both fields
+
+The first pass at this measurement ran against "2025-03-12 + class 202" and
+found the union plateaued at 30 - exactly the unfiltered count, no growth at
+all. That result was wrong, and the leaf it ran against was not what it
+claimed to be. Root cause, found by diffing the exact POST body
+`PjeSearch.buildFormBody` produces against a raw curl reproduction field by
+field: a probe harness had sent `sgbClasseJudicial_selection=202` (the
+internal class id) with `classeJudicial` (the display name) left **empty**.
+The server silently ignores the class filter when the id arrives without the
+name, so every "day + class 202" query in that first pass actually ran as a
+bare day-level query - the class dimension was never applied.
+
+`PjeSearch.buildFormBody` itself was never affected: it has always set both
+`FIELDS.judicialClass` (from `query.judicialClassName`) and
+`FIELDS.judicialClassId` (from `query.judicialClassId`), and `JudicialClassSplit`
+has always populated both from the catalog entry (see `src/pipeline/partition.ts`
+and `src/pje/search.ts`, unchanged by this correction). The bug lived entirely
+in the ad hoc debugging harness used to double-check the live numbers, not in
+the shipped code - but it produced numbers wrong enough (a false "the corpus
+isn't saturated anymore" conclusion) that they had to be retracted rather than
+shipped. See `PROBLEMS.md` §5's "Correction: the judicial-class filter needs
+both the id AND the display name" for the full field-by-field comparison and
+the confirming row-set diff (12 of 30 rows under class 202 do not appear at
+all in the day's unfiltered set - the class filter is doing real, distinct
+work once both fields are sent).
+
 ### Measurement: choosing the token alphabet
 
-Ran live against the real `PjeSearch`/`JsfSession`/`HttpClient` stack
-(`delayMs: 1600`, no `sleep()` of the sweep's own), comparing two candidate
-alphabets on 2025-03-12 + class 202 - the leaf both this issue and
-PROBLEMS.md §5 use as the running saturated example:
+Redone against the leaf PROBLEMS.md's original probe actually used and that
+this issue's own evidence rests on: **2025-03-12, day-level, no class
+filter** (30 rows, capped, warning present - see PROBLEMS.md §5's "third
+dimension" table). Ran live against the real `PjeSearch`/`JsfSession`/
+`HttpClient` stack (`delayMs: 1600`, no `sleep()` of the sweep's own):
 
-**Digraph/trigram alphabet** (two short, frequent Portuguese fragments per
-filter, e.g. `"DE A"`):
+| # | Filter | Rows | Capped | New | Union |
+|---|--------|------|--------|-----|-------|
+| _(seed)_ | _(none)_ | 30 | yes | - | 30 |
+| 1 | `DE A` | 30 | **yes** | - (untrusted) | - |
+| 2 | `DA S` | 12 | no | 1 | 39 |
+| 3 | `OS S` | 23 | no | 2 | 41 |
+| 4 | `NT O` | 21 | no | 3 | 44 |
+| 5 | `ES A` | 18 | no | 0 | 44 |
+| 6 | `RA S` | 21 | no | 0 | 44 |
+| 7 | `AN A` | 18 | no | 0 | 44 |
+| 8 | `IN A` | 23 | no | 0 | 44 |
+| 9 | `RI A` | 21 | no | 1 | 45 |
+| 10 | `DO S` | 21 | no | 0 | 45 |
+| 11 | `ER A` | 30 | **yes** | - (untrusted) | - |
+| 12 | `CO S` | 16 | no | 0 | 45 |
+| 13 | `TE S` | 12 | no | 1 | 46 |
+| 14 | `AL V` | 7 | no | 0 | 46 |
+| 15 | `UZ A` | 0 | no | 0 | 46 |
 
-| Filter | Rows | Capped | Union so far |
-|---|---|---|---|
-| `DE A` | 24 | no | 24 |
-| `DA S` | 6 | no | 26 |
-| `OS S` | 18 | no | 29 |
-| `NT O` | 15 | no | 29 |
-| `ES A` | 13 | no | 30 |
-| `RA S` | 16 | no | 30 |
-| `AN A` | 14 | no | 30 |
-| `IN A` | 13 | no | 30 |
-| `RI A` | 14 | no | 30 |
-| `DO S` | 13 | no | 30 |
-| `ER A` | 24 | no | 30 |
-| `CO S` | 11 | no | 30 |
-| `TE S` | 7 | no | 30 |
-| `AL V` | 5 | no | 30 |
-| `UZ A` | 0 | no | 30 |
+The union plateaus at **46** starting at filter 13 (`TE S`); filters 14-15
+(both uncapped) add nothing further, a genuine flat streak of 2. Filters 1
+and 11 (`DE A`, `ER A`) hit the cap themselves - their rows are still folded
+into the union (they are real, verified cases), but neither their growth nor
+lack of it counts as evidence toward the flat streak (see the code-behavior
+correction below): a capped filter cannot be trusted to say "no new cases",
+only "no new cases *among the ones shown*". A follow-up probe with 7 more
+tokens not in this alphabet (`IL VA`, `SANT OS`, `SIL VA`, `FER RE`, `MEN
+DES`, `CAR LOS`, `MA RIA`), all uncapped, found zero further growth - 9
+consecutive flat, uncapped filters in total (filters 14-15 plus the 7
+exploratory ones), confirming this is a real plateau and not an artifact of a
+short run.
 
-**Single-letter alphabet** (e.g. `"A A"`, `"A B"` - the crudest tokens that
-still pass the "at least two names" validation), on the same leaf:
+**Single-letter alphabet**, measured earlier (before the class-filter bug
+above was found, so on a leaf later shown to be day-only rather than
+day+class - the shape of the result is unaffected by which leaf it ran on,
+since the point is the pattern, not the specific union size):
 
-| Filter | Rows | Capped | Union so far |
-|---|---|---|---|
-| `A A` | 30 | **yes** | 30 |
-| `A B` | 11 | no | 30 |
-| `A C` | 26 | no | 30 |
-| `A D` | 30 | **yes** | 30 |
-| `A E` | 30 | **yes** | 30 |
-
-**Decision: the digraph/trigram alphabet.** Both plateaued at the same union
-size on this leaf, but the single-letter alphabet reached it through filters
-that were **themselves capped** (`A A`, `A D`, `A E`) - each individually
-truncated at exactly 30 rows with the server's own warning, meaning their
-contribution to the union is silently incomplete: the true set behind a
-capped single-letter filter is unknown, not merely "no larger than what was
-returned". A single character matches far too much of the corpus to stay
-under the site's own cap, which defeats the purpose of using it as a *cover*
-signal at all. The digraph/trigram alphabet's 15 probed filters, by contrast,
-all came back uncapped, so every one of them is individually trustworthy -
-what a *measured* completeness claim needs, since there is no proof behind
-it, only observation. `PARTY_TOKEN_ALPHABET` (`party-token-alphabet.ts`)
-holds the chosen 15 tokens, in one place, with this table and reasoning
-alongside it so `party-sweep.ts` itself does not need to justify the choice.
-
-**Stop rule: `plateauAfter: 5` consecutive flat filters (default,
-configurable).** The digraph run above plateaued after 5 consecutive filters
-added nothing (`RA S` through `DO S`, the union already having settled by
-`ES A`); a stricter cutoff (e.g. 3) would have stopped at the same point here,
-but 5 leaves a safety margin against a single unlucky run of overlapping
-filters being mistaken for a genuine plateau, at the cost of at most a few
-extra requests per leaf once the real plateau has already happened.
-Configurable rather than hardcoded because it is a judgment call from one
-measured run, not a proven constant - a future run against a differently
-shaped leaf may want to tune it.
-
-### An honest finding: none of the four "known saturated" leaves still saturate
-
-PROBLEMS.md §5 records a union of 42/41/37/33 unique cases (against an
-unfiltered cap of 30) for four leaves - 2025-03-12, -11, -14, -19, all + class
-202 - measured with nine crude filters at the time PROBLEMS.md was written.
-Re-running the live measurement above against the **same** leaves today
-(2026-08-28) gives a materially different picture:
-
-| Leaf (+ class 202) | Unfiltered rows today | Capped today? |
+| Filter | Rows | Capped |
 |---|---|---|
-| 2025-03-12 | 30 | **yes** |
-| 2025-03-14 | 14 | no |
-| 2025-03-19 | 17 | no |
+| `A A` | 30 | **yes** |
+| `A B` | 11 | no |
+| `A C` | 26 | no |
+| `A D` | 30 | **yes** |
+| `A E` | 30 | **yes** |
 
-(2025-03-11 was checked in the first measurement pass and came back at 19
-rows, uncapped, consistent with ISSUE-3's own resolution recording that same
-number.)
+**Decision: the digraph/trigram alphabet.** Two of fifteen digraph/trigram
+filters were themselves capped here (`DE A`, `ER A`); three of five
+single-letter filters were capped on the earlier run. A single character
+matches far too much of the corpus to reliably stay under the site's 30-row
+cap, and single-letter filters would be capped even more often at scale -
+which defeats the purpose of using a filter as a *cover* signal at all, since
+a capped filter's own rows are silently incomplete and cannot be trusted to
+report "no new cases." `PARTY_TOKEN_ALPHABET` (`party-token-alphabet.ts`)
+holds the chosen 15 tokens with this table and reasoning alongside it, so
+`party-sweep.ts` itself does not need to justify the choice.
 
-Only 2025-03-12 still saturates. On that one live leaf, the digraph alphabet's
-union plateaued at exactly 30 - the same as the unfiltered count - rather than
-past it, and a follow-up probe with six further tokens not in the chosen
-alphabet (`IL VA`, `SANT OS`, `SIL VA`, `FER RE`, `MEN DES`, `CAR LOS`) found
-zero new cases, all uncapped. This is a real, reproducible result, not a bug
-in the cover: **PJe TRF5 is a live production system**, and the case data
-behind a fixed date + class window is not static - cases can be filed,
-reassigned between classes, or otherwise move between when PROBLEMS.md's
-original probe ran and this one. The corpus a `DateRangeSplit` +
-`JudicialClassSplit` cascade sees today is not guaranteed to be the same
-corpus PROBLEMS.md described, and this cover's job is only ever to react to
-*today's* saturation, whatever that turns out to be.
+**Stop rule: `plateauAfter: 5` consecutive flat, *uncapped* filters (default,
+configurable).** The digraph run above plateaued at filter 13, with filters
+14-15 flat and the 7 exploratory tokens afterward extending that to 9
+consecutive flat, uncapped filters - well past the default threshold of 5,
+which is a deliberate safety margin over the minimum needed here (2, per this
+run) against a single unlucky run of overlapping filters being mistaken for a
+genuine plateau, at the cost of at most a few extra requests per leaf once
+the real plateau has already happened. Configurable rather than hardcoded
+because it is a judgment call from one measured run, not a proven constant.
 
-This means the acceptance criterion "a leaf that saturates under day + class
-yields more than 30 unique cases" could not be demonstrated live on the two
-leaves the issue names, because as of this measurement pass **the leaves
-named no longer both saturate**, and the one that does happens to have
-exactly 30 real cases behind it today - the cover correctly reports `covered`
-at union 30 rather than fabricating growth that is not there. The
-`createPartyTokenSweep` unit tests (`test/party-sweep.test.ts`) instead prove
-the mechanism directly with a scripted fake search that *does* return more
-than 30 unique cases across its filters, which is the part of the acceptance
-criterion actually testable without depending on a live corpus's state at a
-particular moment; the live run above is evidence the mechanism also behaves
-correctly (covered vs. abandoned, budget respected, capped filters treated as
-untrustworthy) against the real server, not a claim that this specific leaf
-still exceeds 30 today.
+### Correction: a capped filter's silence must not count toward the plateau
+
+The stop rule is meant to trust only an *uncapped* filter's "no new cases" as
+evidence a plateau is real (the coordinator's review flagged this
+explicitly, matching the same distrust already applied when comparing
+alphabets above). `createPartyTokenSweep`'s implementation did not actually
+enforce this: it incremented (or reset) the flat-streak counter based purely
+on whether the union grew, regardless of `response.capped`. A capped filter
+that happened to add nothing new to the union would silently count as a flat
+filter, which could trigger `covered` on a leaf that is not actually
+covered - the capped filter might be hiding cases beyond its own 30-row
+cutoff that a later, uncapped filter would have found.
+
+Fixed in `src/pipeline/party-sweep.ts`: the flat-streak counter is now only
+updated when `response.capped` is false; a capped filter's rows still get
+folded into the union (they are real, verified cases, so they can only help),
+but its silence neither starts nor extends the streak. Added
+`test/party-sweep.test.ts`, "does not let a capped filter satisfy the
+plateau, even when it adds nothing new" - two capped, flat filters in the
+middle of a run must not trigger `covered` with `plateauAfter: 2`; only two
+*uncapped* flat filters afterward do. This test fails under the pre-fix
+behavior (it would have plateaued three filters too early, at
+`filtersTried: 3` instead of `5`).
+
+### An honest finding, corrected: 2025-03-12 (day-level) does saturate, and the party filter does escape the cap
+
+The measurement above confirms PROBLEMS.md §5's original finding rather than
+contradicting it, once run against the leaf that finding actually describes.
+An earlier draft of this section claimed the four leaves PROBLEMS.md records
+as saturated (day + class 202) no longer saturate today, and that the corpus
+must have drifted since PROBLEMS.md was written. That claim was wrong and has
+been retracted: it was an artifact of the class-filter bug above, not a
+genuine change in the site's data. Every number in this section's table now
+comes from a leaf verified, field by field, to carry the class filter
+correctly - see the debugging section above and `PROBLEMS.md` §5's
+corresponding correction.
 
 ### `data/uncoverable.ndjson`
 
@@ -300,20 +327,22 @@ timestamp, and appending (not overwriting) across multiple abandoned leaves.
 
 ### Verification
 
-`npm test`: **98 tests green** (89 pre-existing + 7 in `test/party-sweep.test.ts`
+`npm test`: **99 tests green** (89 pre-existing + 8 in `test/party-sweep.test.ts`
 + 2 in `test/uncoverable.test.ts`, both `test/sweep.test.ts` cover-seam tests
 updated in place for the `CoverEvent` split), no network. `npm run typecheck`:
 clean.
 
 `test/party-sweep.test.ts` covers: plateau after N consecutive flat filters
 (`covered`, correct `filtersTried`/`unionSize`, and the token *after* the
-plateau is never even tried); budget exhausted while still growing
-(`abandoned`); the first response's rows counted toward the union without a
-repeated request; a `RejectedQueryError` skipped rather than fatal (and still
-charged against the budget); any other error propagating instead of being
-swallowed; deduplication across overlapping filters; and a `sweep()`
-integration test proving a leaf `DateRangeSplit`/`JudicialClassSplit` cannot
-split any further reaches `covered` through the cover, never `unsplittable`.
+plateau is never even tried); a capped filter's silence not counting toward
+the plateau, even when it adds nothing new (the correction above); budget
+exhausted while still growing (`abandoned`); the first response's rows
+counted toward the union without a repeated request; a `RejectedQueryError`
+skipped rather than fatal (and still charged against the budget); any other
+error propagating instead of being swallowed; deduplication across
+overlapping filters; and a `sweep()` integration test proving a leaf
+`DateRangeSplit`/`JudicialClassSplit` cannot split any further reaches
+`covered` through the cover, never `unsplittable`.
 
 ### What is measured, not proved
 
@@ -321,12 +350,12 @@ Per the issue's own framing (and `partition.ts`'s module comment): unlike
 `DateRangeSplit`/`JudicialClassSplit`, whose subqueries are disjoint by
 construction and so terminate with *proved* completeness, `PartyTokenSweep`'s
 filters overlap and its termination is empirical. A `covered` event means the
-union stopped growing for `plateauAfter` consecutive filters from *this*
-alphabet - not that no other token, from a different alphabet or a longer
-run, could ever add one more case. The measurement above is the actual
-evidence available for that claim on the one leaf that still saturated at
-measurement time: 21 filters total (15 chosen + 6 exploratory) with zero new
-cases past the 6th, uncapped throughout. An `abandoned` event is the honest
-alternative when the budget runs out first, written to
-`data/uncoverable.ndjson` specifically so a completeness claim is never
-implied where it was not earned.
+union stopped growing for `plateauAfter` consecutive *uncapped* filters from
+*this* alphabet - not that no other token, from a different alphabet or a
+longer run, could ever add one more case, and not that a capped filter's own
+truncation hides nothing further. The measurement above is the actual
+evidence available for that claim on 2025-03-12: 22 filters total (15 chosen
++ 7 exploratory) with zero new cases past filter 13, 9 of them uncapped in a
+row. An `abandoned` event is the honest alternative when the budget runs out
+first, written to `data/uncoverable.ndjson` specifically so a completeness
+claim is never implied where it was not earned.

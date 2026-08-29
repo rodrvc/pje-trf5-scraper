@@ -201,28 +201,63 @@ The defensive condition `rows >= 30 || warning present` stays, because a silent 
 would create exactly the gap it guards against — but it is a precaution, not a
 response to observed behaviour.
 
-### ISSUE-4b: the corpus behind a saturated leaf is not static
+### Correction: the judicial-class filter needs both the id AND the display name
 
-Re-measuring the same four leaves from the "third dimension" table above, months
-later (2026-08-28), against the live server:
+While re-measuring for ISSUE-4b, a raw curl probe sending only
+`fPP:j_id189:sgbClasseJudicial_selection=202` (the internal class id) with
+`fPP:j_id189:classeJudicial` left **empty** returned the day's bare (unfiltered)
+result set instead of a class-202 one — i.e. the class filter was **silently
+ignored** when the id is sent without the display name. Every "day + class
+202" figure this section originally recorded from that probe was actually a
+day-only figure; the mistake reproduced identically three times before its
+cause was found.
 
-| Leaf (+ class 202) | Unfiltered rows now | Capped now? |
-|---|---|---|
-| 2025-03-11 | 19 | no |
-| 2025-03-12 | 30 | yes |
-| 2025-03-14 | 14 | no |
-| 2025-03-19 | 17 | no |
+Re-probed sending **both** fields together
+(`sgbClasseJudicial_selection=202` and `classeJudicial=AGRAVO DE INSTRUMENTO`,
+exactly what `PjeSearch.buildFormBody` already sends — see `src/pje/search.ts`,
+which was never affected by this bug, since it always sets both fields):
 
-Only 2025-03-12 still saturates; the other three no longer do. PJe TRF5 is a live
-production system: cases filed under a fixed date + class window can be reassigned
-between classes, or otherwise move, well after the date they were filed under. A
-union measured against one of these leaves is only ever a snapshot of that leaf's
-corpus **at measurement time** — a filter alphabet chosen and validated on one day
-is not guaranteed to reproduce the exact same union size on another. This is why
-`ISSUE-4b`'s cover reports `covered`/`abandoned` per run rather than asserting a
-fixed expected union size, and why its own resolution documents this measurement
-alongside the token alphabet decision. See `issues/ISSUE-4b-party-sweep.md`'s
-Resolution for the full live comparison and the party-token alphabet this drove.
+| Query | Rows | Capped? | Warning text? | Last row |
+|---|---|---|---|---|
+| 2025-03-12, no class | 30 | yes | **yes** | `0803807-42.2025.4.05.0000` |
+| 2025-03-12 + class 202 | 30 | yes | **no** | `0803864-60.2025.4.05.0000` |
+| 2025-03-11 + class 202 | 19 | no | — | — |
+
+The class filter is doing real work here: of the 30 rows returned for
+2025-03-12 + class 202, 12 do not appear at all in the 30 rows returned for
+2025-03-12 with no class filter — two genuinely different result sets, not a
+silently-dropped filter producing the same output twice. This is why
+`JudicialClassSplit` (`src/pipeline/partition.ts`) always sends both the id
+and the display name from the catalog entry: sending the id alone, which
+reads as "more specific," actually degrades silently into an unfiltered day
+query, which would make the sweep think a day was covered by class splits
+when the class dimension was never applied at all.
+
+**The third-dimension evidence above (2025-03-12 + class 202, the `DA
+S`/`DE A`/etc. table and the nine-filter union of 42) was measured correctly**
+and is unaffected by this bug — `PjeSearch.buildFormBody` sends both class
+fields, and only a hand-rolled curl probe missing the name field ever showed
+the wrong numbers. Re-confirmed live during ISSUE-4b (see its Resolution for
+the full digraph/trigram measurement built on this same leaf, reaching 46
+unique cases past the 30-row cap).
+
+### Note: a saturated leaf can show exactly 30 rows with no warning text
+
+2025-03-12 + class 202 (table above) hits the 30-row cap **without** the
+"muitos processos" warning — contradicting the earlier "cap warning was never
+observed to be absent" correction, and confirmed independently across
+multiple live probes (both raw curl and `PjeSearch`). The likely explanation:
+the warning text appears only when *more than* 30 rows would otherwise be
+returned, so a leaf whose true total is exactly 30 hits the count cap without
+crossing into "too many to show" territory server-side — 2025-03-12 with no
+class filter, by contrast, does have more than 30 and shows the warning as
+expected. This is a **conservative false positive** for the defensive rule
+`rows >= 30 || warning present`: a leaf like this gets treated as saturated
+and handed to `JudicialClassSplit`/`PartyTokenSweep` even when it has nothing
+further to give, costing a few wasted requests (the party-token cover
+plateaus almost immediately, `unionSize` barely moving past the seed), but it
+never drops a case. The rule stays exactly as specified — undercounting a
+real cap would be the opposite, and much worse, mistake.
 
 ---
 
