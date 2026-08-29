@@ -40,6 +40,12 @@ describe('sanitiseSegment', () => {
     const result = sanitiseSegment('../../etc/passwd');
     expect(result).not.toContain('/');
   });
+
+  it('rejects a segment that is only dots, so it cannot resolve to "." or ".."', () => {
+    expect(sanitiseSegment('..')).toBe('_');
+    expect(sanitiseSegment('.')).toBe('_');
+    expect(sanitiseSegment('...')).toBe('_');
+  });
 });
 
 describe('caseDir', () => {
@@ -80,5 +86,14 @@ describe('pdfPath', () => {
   it('falls back to a placeholder when date is missing, without crashing', () => {
     const path = pdfPath('/root', 'case', doc({ date: '' }));
     expect(path).toContain('undated');
+  });
+
+  it('caps the readable kind segment so an unbounded server-supplied name cannot blow past filesystem limits', () => {
+    const hugeName = 'A'.repeat(500);
+    const path = pdfPath('/root', 'case', doc({ kind: hugeName }));
+    const fileName = path.split('/').pop() ?? '';
+    // <date>_ + up to 80 chars of kind + _<id>.pdf
+    expect(fileName.length).toBeLessThan(120);
+    expect(fileName).toContain('2683486');
   });
 });
