@@ -643,4 +643,72 @@ describe('Scraper (orchestrator)', () => {
       });
     },
   );
+
+  it('budget: maxRequests gates per document, not just per case - the row stays pending and completeRow is not called', async () => {
+    // requestCounter reaches the budget exactly when detail.fetch runs (a
+    // stand-in for HttpClientOptions.onRequest firing on the real request
+    // detail makes) - i.e. AFTER the sweep's own pre-search check passed,
+    // but BEFORE any document download is attempted.
+    const requestCounter = fakeRequestCounter();
+    const search = async (_query: Query): Promise<SearchResponse> => response([row('case-a')]);
+    const documents = [doc('d1'), doc('d2')];
+    const detail: DetailFetcher = {
+      async fetch(_ca, _expectedNumber) {
+        requestCounter.bump(1);
+        return legalCase('case-a', documents);
+      },
+    };
+    const downloader = fakeDownloader({
+      d1: { ok: true, path: '/x/d1.pdf', bytes: 1, skipped: false },
+      d2: { ok: true, path: '/x/d2.pdf', bytes: 1, skipped: false },
+    });
+    const logger = recordingLogger();
+
+    const scraper = new Scraper({ search, detail, downloader, store, chain: noopChain(), logger, requestCounter, limits: { maxRequests: 1 } });
+    const summary = await scraper.run(RANGE);
+
+    expect(summary.stoppedBy).toBe('maxRequests');
+    expect(downloader.calls).toEqual([]); // gated before the first document attempt
+    // The case was appended (still pending), never completeRow'd: a resumed
+    // run re-attempts only the documents that never got tried.
+    expect(await store.hasCase('case-a')).toBe(true);
+    expect(await store.listPendingRows()).toMatchObject([{ number: 'case-a' }]);
+  });
+
+  it('classSplitCheck: a budget stop (interrupted) suppresses the verdict instead of reporting a partial sum as ok: false', async () => {
+    const classA: JudicialClass = { id: '1', name: 'Class A' };
+    const classB: JudicialClass = { id: '2', name: 'Class B' };
+    const chain = new PartitionChain([new DateRangeSplit(), new JudicialClassSplit([classA, classB])]);
+    const rows = (n: number, prefix: string): SearchResultRow[] =>
+      Array.from({ length: n }, (_, i) => row(`${prefix}-${i}`));
+
+    const requestCounter = fakeRequestCounter();
+    let searchCalls = 0;
+    const search = async (query: Query): Promise<SearchResponse> => {
+      searchCalls += 1;
+      requestCounter.bump(1); // one "request" per search, like the real onRequest
+      if (query.judicialClassId === undefined) return response(rows(30, 'day1'), true);
+      // Only class A's window is ever reached before the budget stops the walk.
+      return response(rows(5, 'a'));
+    };
+    const logger = recordingLogger();
+    const scraper = new Scraper({
+      search,
+      detail: fakeDetail({}),
+      downloader: fakeDownloader({}),
+      store,
+      chain,
+      logger,
+      requestCounter,
+      limits: { maxRequests: 2 }, // the capped day + class A's window, no more
+    });
+    const summary = await scraper.run(RANGE);
+
+    expect(summary.stoppedBy).toBe('maxRequests');
+    expect(searchCalls).toBe(2);
+    const check = logger.events.find((e) => e.kind === 'classSplitCheck');
+    // A partial sum (5 rows, far short of 30) must NOT be reported as
+    // ok: false - the run was interrupted, not a sign of a missing class.
+    expect(check).toMatchObject({ kind: 'classSplitCheck', ok: undefined, incomplete: true });
+  });
 });
