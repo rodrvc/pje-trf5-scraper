@@ -55,6 +55,8 @@ export interface HttpClientOptions {
   userAgent?: string;
   /** Called before each rate-limit wait, so it can be logged. */
   onRetry?: (info: { attempt: number; delayMs: number; url: string }) => void;
+  /** Called once per network attempt actually sent, so a caller can track a request budget (ISSUE-9c). */
+  onRequest?: (info: { url: string }) => void;
 }
 
 /** A response already decoded to text. */
@@ -81,6 +83,7 @@ export class HttpClient {
   private readonly circuitBreakerThreshold: number;
   private readonly backoff: BackoffOptions;
   private readonly onRetry: HttpClientOptions['onRetry'];
+  private readonly onRequest: HttpClientOptions['onRequest'];
 
   /** Timestamp of the last request, used to space out the next one. */
   private lastRequestMs = 0;
@@ -103,6 +106,7 @@ export class HttpClient {
     this.circuitBreakerThreshold = options.circuitBreakerThreshold ?? 10;
     this.backoff = options.backoff ?? DEFAULT_BACKOFF;
     this.onRetry = options.onRetry;
+    this.onRequest = options.onRequest;
 
     this.jar = new CookieJar();
     this.axios = wrapper(
@@ -207,6 +211,7 @@ export class HttpClient {
 
       let response: AxiosResponse;
       try {
+        this.onRequest?.({ url });
         response = await this.axios.request(config);
       } catch (error) {
         // Network failure: retried under the same policy as a 429, since it is
