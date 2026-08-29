@@ -132,6 +132,15 @@ stopped by: maxRequests
 
 Re-running the same command picks up the 8 pending rows (see "Resuming" below).
 
+Do not be surprised by the occasional `case ... FAILED: UnexpectedDetailPageError:
+... database error page` line on other days: the court's server itself sometimes
+answers a case's detail view with an internal error page (a PostgreSQL
+"read-only transaction" exception) instead of the case. The scraper records such a
+case in `data/failed-cases.ndjson` as retryable and moves on to the next one; a
+later `npm run scrape -- --retry-failed` re-attempts it (up to three attempts in
+total). See "Sealed cases" below and `PROBLEMS.md` §6 for how that page is told
+apart from a genuinely sealed case.
+
 By default a run is **bounded**: `--max-requests` (default 40) and `--max-cases`
 (default 3) stop it well short of a full crawl, so it is safe to run repeatedly
 against the real court server. Pass `--unbounded` to remove both limits for a full
@@ -191,10 +200,13 @@ and the run continues with the next one rather than stopping. If 429s keep arriv
 back to back, a circuit breaker trips and the run aborts cleanly, still printing the
 summary collected so far.
 
-No 429 was ever triggered against the real TRF5 server during development — this is
-demonstrated instead by tests against a simulated HTTP server (`test/client.test.ts`,
-`test/download.test.ts`, `test/backoff.test.ts`), covering a 429 with and without
-`Retry-After`, retry exhaustion, and the circuit breaker tripping and resetting.
+During development the real TRF5 server never rate-limited a single probe, so the
+behaviour was built and verified against a simulated HTTP server
+(`test/client.test.ts`, `test/download.test.ts`, `test/backoff.test.ts`), covering
+a 429 with and without `Retry-After`, retry exhaustion, and the circuit breaker
+tripping and resetting. The one genuine burst of 429s seen so far is the one in the
+quick-start capture above: five real responses from the court server, each waited
+out with the backoff shown, after which the search went through.
 
 TRF5's PJe is a real court's public production service. The scraper uses
 **concurrency 1** and a configurable delay between requests (`--delay-ms`, floor
