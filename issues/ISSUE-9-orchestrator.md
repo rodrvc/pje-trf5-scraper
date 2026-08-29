@@ -211,3 +211,76 @@ gains `windowsSkipped`/`windowsRejected`, fed from the sweep's `skipped`/
 `rejected` events. `SweepProgressStore.rebuildCoveredPredicate()` now
 excludes `abandoned` leaves (kept in the seen set) - a cover's incomplete
 leaf must be re-attempted by a later run, not skipped forever.
+
+## Resolution (part 3 of 3: budgets and the demo run)
+
+Status stays `todo`: part 2 (resume/retry, 9b) is still an open PR
+(`orchestrator-resume`, #16) at the time this lands, not yet merged into
+`main` - closing the issue here would be premature. Flip it once #16 merges.
+
+Added `ScraperOptions.limits?: { maxRequests?: number; maxCases?: number }`
+to `src/pipeline/orchestrator.ts`. Enforcement is a single `budgetExceeded`
+helper, checked at exactly two points: before every `generator.next()` in
+`runSweep` (so a hit means no further search, ever) and before every row's
+detail fetch, in both `runSweep`'s per-window loop and `drainPendingRows`.
+Hitting a budget sets `stoppedBy` and calls `generator.return()` to close the
+sweep's async generator cleanly - no dangling `walk` frames, no further
+searches. A stop is **not** an abort: `run()` still resolves with the
+`RunSummary` (now carrying `stoppedBy: 'maxRequests' | 'maxCases' | undefined`),
+never throws `RunAbortedError` for it. Whatever case was already mid-flight
+when the budget was checked still finishes its downloads and its
+`completeRow` - the budget only ever gates *starting* new work, matching the
+brief: "downloads of the current case still complete".
+
+**Class-split sanity check** (ISSUE-4's resolution asks ISSUE-9 to run this):
+a small `ClassSplitCheck` class observes the same `SweepEvent` stream
+`runSweep` already walks. On a `capped` event with `splitBy ===
+'judicial-class'` it opens a running total; every final event at
+`depth === cappedDepth + 1` adds to it; the subtree closes (logging
+`classSplitCheck { day, childrenRows, ok: childrenRows >= 30 }` through the
+`LogSink`) at the next event with `depth <= cappedDepth`, or when the sweep
+ends (`finally` block). One helper, one parameterized test
+(`test/orchestrator.test.ts`, an `it.each` over `[20, 15, true]` and
+`[5, 4, false]`) using a real `JudicialClassSplit` with a two-class fake
+catalog.
+
+**`scripts/smoke-orchestrator.ts`** (`npm run smoke:orchestrator`): wires the
+real `HttpClient`/`JsfSession`/`PjeSearch`/`PjeDetail`/`PjeDownloader`/
+`PersistenceStore` stack, fetches the real class catalog, and runs one
+bounded `Scraper.run()`. Flags: `--from`/`--to` (default yesterday, UTC),
+`--max-requests` (default 40), `--max-cases` (default 3), `--delay-ms`
+(default 1500). Prints the `RunSummary` as one readable line per field.
+`data/`/`pdfs/` are gitignored (verified - both already listed).
+
+**Tests**: 5 new in `test/orchestrator.test.ts` (222 total, up from 217):
+stops at `maxRequests` with `stoppedBy` set and no further search after the
+stop (an always-splittable fake chain proves the budget, not an exhausted
+chain, ends the walk); stops at `maxCases` after finishing the in-flight
+case's downloads and row completion; one test covering both "no limits ->
+`stoppedBy` undefined" and "a budget stop resolves normally, never throws";
+and the class-split check (`it.each`, 2 cases). `npm test`: 222/222 green.
+`npm run typecheck`: clean.
+
+**Live smoke**: `2025-03-05..2025-03-05`, `--max-cases=3 --max-requests=40`,
+`delayMs: 1500`, against the real TRF5 site.
+
+| Metric | Value |
+|---|---|
+| Windows | 1 |
+| Cases listed | 10 |
+| Cases detailed | 3 |
+| Cases failed | 0 |
+| Documents downloaded | 24 (595,707 bytes total) |
+| Documents failed | 0 |
+| Requests | 42 |
+| 429 retries | 0 |
+| Stopped by | `maxRequests` |
+
+The day did not saturate (10 rows, uncapped), so no class-split subtree was
+exercised in this particular live run - the `classSplitCheck` logic is
+covered by the scripted unit test instead, which exercises both the `ok:
+true` and `ok: false` branches directly. The stop landed cleanly at 42
+requests (just past the 40 budget: the check runs before starting a row's
+detail fetch, not mid-download, so the third case's own downloads - already
+in flight - still completed, exactly as designed) with 7 rows left pending
+for a resumed run (9b) to pick up. `data/`/`pdfs/` were deleted after the run.
