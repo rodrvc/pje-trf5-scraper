@@ -104,7 +104,18 @@ export function createPartyTokenSweep(options: PartyTokenSweepOptions = {}): Cov
       for (const row of response.rows) union.set(row.number, row);
       const grew = union.size > sizeBefore;
 
-      flatStreak = grew ? 0 : flatStreak + 1;
+      // A filter that is itself capped is untrustworthy as a "no new cases"
+      // signal: its own rows are truncated at the site's 30-row limit, so it
+      // may be hiding cases beyond what it reported, whether or not it added
+      // anything to the union this time. Its rows still get folded into the
+      // union above (they are still real, verified cases), but it must not
+      // count toward - or reset - the flat streak either way, the same
+      // distrust already applied when comparing alphabets (see
+      // party-token-alphabet.ts): only an uncapped filter's silence is
+      // evidence the plateau is real.
+      if (!response.capped) {
+        flatStreak = grew ? 0 : flatStreak + 1;
+      }
 
       if (flatStreak >= plateauAfter) {
         yield {

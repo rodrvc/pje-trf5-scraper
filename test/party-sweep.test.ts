@@ -62,6 +62,55 @@ describe('createPartyTokenSweep', () => {
     expect(calls).toEqual(['T1', 'T2', 'T3', 'T4', 'T5']);
   });
 
+  it('does not let a capped filter satisfy the plateau, even when it adds nothing new', async () => {
+    // T1 grows the union. T2 and T3 are capped and add nothing new - per the
+    // coordinator's explicit rule, a capped filter's silence is not trusted
+    // evidence of a plateau, so they must not count toward flatStreak. T4 is
+    // uncapped and flat, genuinely starting the streak. With plateauAfter:
+    // 2, the plateau should only fire after T4 AND T5 (both uncapped, both
+    // flat) - not after T2/T3 alone, which a buggy implementation ignoring
+    // `capped` would wrongly treat as two flat filters.
+    const alphabet = ['T1', 'T2', 'T3', 'T4', 'T5', 'T6'];
+    const search = async (query: Query): Promise<SearchResponse> => {
+      switch (query.partyName) {
+        case 'T1':
+          return response([row('a'), row('b')]);
+        case 'T2':
+          // Capped and adds nothing: must not count as a flat filter.
+          return response([row('a')], true);
+        case 'T3':
+          // Also capped, also flat: still must not count.
+          return response([row('b')], true);
+        case 'T4':
+          // Uncapped and flat: the real streak starts here.
+          return response([row('a')]);
+        case 'T5':
+          // Uncapped and flat again: plateau reached here (streak of 2).
+          return response([row('b')]);
+        default:
+          // T6 must never be tried.
+          return response([row('z')]);
+      }
+    };
+
+    const calls: string[] = [];
+    const wrappedSearch = async (query: Query): Promise<SearchResponse> => {
+      calls.push(query.partyName ?? '');
+      return search(query);
+    };
+
+    const cover = createPartyTokenSweep({ alphabet, plateauAfter: 2 });
+    const events = [];
+    for await (const event of cover(leaf, response([]), wrappedSearch)) events.push(event);
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.type).toBe('covered');
+    if (events[0]?.type === 'covered') {
+      expect(events[0].filtersTried).toBe(5);
+    }
+    expect(calls).toEqual(['T1', 'T2', 'T3', 'T4', 'T5']);
+  });
+
   it('reports abandoned when the budget runs out while the union is still growing', async () => {
     // Every filter keeps adding a new case, so the plateau condition never
     // fires; the alphabet (acting as the budget here) runs out first.
