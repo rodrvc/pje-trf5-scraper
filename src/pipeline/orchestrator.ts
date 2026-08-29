@@ -528,22 +528,40 @@ export class Scraper {
    */
   async retryFailed(): Promise<RunSummary> {
     const summary = emptySummary();
+    this.stoppedBy = undefined;
 
     try {
       for (const failedCase of await this.store.listRetryableCases()) {
+        // Same budget gate as run()'s per-row check: stop before starting
+        // any further case's detail fetch once a limit is reached.
+        const exceeded = this.budgetExceeded(summary);
+        if (exceeded !== undefined) {
+          this.stoppedBy = exceeded;
+          break;
+        }
         await this.retryFailedCase(failedCase, summary);
       }
 
-      const caseIndex = await this.store.indexCases();
-      for (const failedDocument of await this.store.listRetryableDocuments()) {
-        await this.retryFailedDocument(failedDocument, caseIndex, summary);
+      if (this.stoppedBy === undefined) {
+        const caseIndex = await this.store.indexCases();
+        for (const failedDocument of await this.store.listRetryableDocuments()) {
+          // Same budget gate, before any further document's re-download.
+          const exceeded = this.budgetExceeded(summary);
+          if (exceeded !== undefined) {
+            this.stoppedBy = exceeded;
+            break;
+          }
+          await this.retryFailedDocument(failedDocument, caseIndex, summary);
+        }
       }
     } catch (error) {
+      summary.stoppedBy = this.stoppedBy;
       await this.finalizeSummary(summary);
       this.logger.log({ kind: 'run-aborted', reason: describeError(error) });
       throw new RunAbortedError(error, summary);
     }
 
+    summary.stoppedBy = this.stoppedBy;
     await this.finalizeSummary(summary);
     return summary;
   }
@@ -574,9 +592,16 @@ export class Scraper {
     summary.casesDetailed += 1;
     this.logger.log({ kind: 'case-detailed', number: legalCase.number });
 
-    await this.downloadDocuments(legalCase, summary);
+    // Same per-document gate as run()'s downloadDocuments: if the budget
+    // stops mid-case, the case's already-downloaded documents are still
+    // persisted (appendCase, below), but recordCaseSuccess is skipped so
+    // this case stays in the retry ledger for a later retryFailed() call to
+    // finish, rather than being marked fully retried when it was not.
+    const completed = await this.downloadDocuments(legalCase, summary);
     await this.store.appendCase(legalCase);
-    await this.store.recordCaseSuccess(legalCase.number);
+    if (completed) {
+      await this.store.recordCaseSuccess(legalCase.number);
+    }
   }
 
   /** Re-attempts one previously-failed document, only if its case is still on disk. */
