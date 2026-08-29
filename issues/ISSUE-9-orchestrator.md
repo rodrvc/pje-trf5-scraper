@@ -242,6 +242,9 @@ ends (`finally` block). It is a **fresh-run diagnostic**: a non-final child
 suppress the verdict (`ok: undefined, incomplete: true`) rather than report
 a partial sum as a false catalog alarm.
 
+**Note (ISSUE-8):** `scripts/smoke-orchestrator.ts` was later promoted into
+the real CLI (`npm run scrape`, `src/cli/`) and removed - see ISSUE-8.
+
 **`scripts/smoke-orchestrator.ts`** (`npm run smoke:orchestrator`): wires the
 real `HttpClient`/`JsfSession`/`PjeSearch`/`PjeDetail`/`PjeDownloader`/
 `PersistenceStore` stack, fetches the real class catalog, and runs one
