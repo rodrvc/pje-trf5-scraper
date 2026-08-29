@@ -6,21 +6,28 @@
  * flags and instantiates a `Scraper`; every decision about what to do with a
  * sweep event, a failed detail fetch or a failed download lives here.
  *
- * This PR builds only the loop and its failure policy. Resume/retry
- * (`--retry-failed`, skipping already-covered windows across runs) is 9b;
- * request budgets and rate limits are 9c. `seen`, `isCovered` and
- * `maxRequests` are accepted as options so this run can already be pointed at
- * a `PersistenceStore`-backed dedup/coverage state, but this PR does not add
- * any behavior around request budgets - see the TODOs below.
+ * This PR builds only the loop and its failure policy. Resume/retry is 9b;
+ * request budgets and rate limits are 9c - see the TODOs on `ScraperOptions`
+ * for the exact seams each is meant to plug into.
+ *
+ * Rows are detailed as soon as their window is recorded (interleaved with the
+ * sweep), not after the whole range has been walked: the sweep already walks
+ * "from the present backwards" so a short or interrupted run still lands
+ * complete, contiguous, *detailed* cases near one end of the range, not just
+ * complete search windows with nothing behind them - and a future budget
+ * (9c) would otherwise be spent entirely on searching before a single case
+ * gets detailed. `drainPendingRows` still runs once at the end, for rows a
+ * previous run left pending (resume, 9b) or that a `cover`'s dedup left
+ * unprocessed mid-walk.
  *
  * ## Failure policy
  *
- * | Failure                                          | Action                                          |
- * |---------------------------------------------------|--------------------------------------------------|
- * | `detail.fetch` throws anything **except** `CircuitBreakerError` (`ParseError`, `UnexpectedDetailPageError`, a `RateLimitError` that exhausted its retries, a raw network error, ...) | `store.recordCaseFailure({ retryable: true, reason: "<ErrorName>: <message>" })`, dequeue the row, continue with the next row |
- * | `search` throws `RejectedQueryError` (surfaced as a sweep-level failure) | logged through the sink as a sweep failure, continue the run |
+ * | Failure | Action |
+ * |---|---|
+ * | `detail.fetch` throws anything **except** `CircuitBreakerError` (`ParseError`, `UnexpectedDetailPageError`, an exhausted `RateLimitError`, a raw network error, ...) | `store.recordCaseFailure({ retryable: true, reason: "<ErrorName>: <message>" })`, dequeue the row, continue with the next row |
+ * | `search` throws `RejectedQueryError` | **the whole `sweep()` walk ends** (it catches nothing itself - see `sweep.ts`): logged as a sweep-level failure against the run's root query, remaining windows of this run are simply never listed. They are not lost forever - a resumed run (9b) re-walks unrecorded windows - but this run does not retry them itself. Catching per-leaf, inside `sweep()`, so one rejected leaf does not end the whole walk, is left as a 9b follow-up |
  * | a document download fails - `DownloadResult` with `ok: false`, or `downloader.download` itself throwing anything **except** `CircuitBreakerError` | `store.recordDocumentFailure(...)`, continue with the next document |
- * | `CircuitBreakerError`, from detail, download or the sweep | finish the writes already in flight for the current row, then rethrow - abort the run cleanly |
+ * | `CircuitBreakerError`, from detail, download or the sweep | finish the writes already in flight for the current row, then throw `RunAbortedError` carrying the summary so far - abort the run cleanly |
  *
  * The brief's "continue with the next document/case if the error persists
  * after several attempts" is exactly what `PjeDownloader`'s own retry/session
@@ -32,16 +39,39 @@
  * "stop hammering the server altogether" overrides "continue on this row",
  * which is why it is the only error kind this loop does not turn into a
  * recorded, continued-past failure.
+ *
+ * ## Crash safety across detail and downloads
+ *
+ * A case's detail is stored (`store.appendCase`, still pending) *before* its
+ * documents are downloaded, and dequeued only once, in one `completeRow`
+ * call *after* the downloads - never `completeRow` before downloads, which
+ * would dequeue the row while its PDFs are still in flight: a kill in
+ * between would leave the case indexed with no `localPath`s and the row no
+ * longer pending, so a resumed run would skip it as "already detailed" and
+ * its documents would never be fetched. A row that resume (9b) finds already
+ * indexed is therefore not just dequeued: its stored case is re-run through
+ * `downloadDocuments` first (cheap for whatever already downloaded - see
+ * `PjeDownloader.download`'s own valid-file check - and real work for
+ * whatever did not) and only then `completeRow`'d.
  */
 
 import type { CaseDocument, LegalCase, Query, SearchResultRow } from '../domain/types.js';
 import { CircuitBreakerError, RejectedQueryError } from '../domain/errors.js';
-import type { PjeDetail } from '../pje/detail.js';
-import type { DownloadResult, PjeDownloader } from '../pje/download.js';
+import type { DownloadResult } from '../pje/download.js';
 import type { PersistenceStore } from '../persistence/store.js';
 import { isFinalSweepEvent } from '../persistence/store.js';
 import { sweep, type CoverFn, type SeenSet, type SearchFn, type SweepEvent } from './sweep.js';
 import type { PartitionChain } from './partition.js';
+
+/** Everything `detail.fetch` needs to expose - a one-method seam so tests fake it without `PjeDetail`. */
+export interface DetailFetcher {
+  fetch(ca: string, expectedNumber?: string): Promise<LegalCase>;
+}
+
+/** Everything `downloader.download` needs to expose - a one-method seam so tests fake it without `PjeDownloader`. */
+export interface DocumentDownloader {
+  download(caseNumber: string, doc: CaseDocument, ca?: string): Promise<DownloadResult>;
+}
 
 /** Everything the orchestrator logs, so a CLI (or a test) can render it however it likes. */
 export type OrchestratorLogEvent =
@@ -67,45 +97,75 @@ export interface RunSummary {
   documentsDownloaded: number;
   documentsSkipped: number;
   documentsFailed: number;
-  /** 429 retries observed via `HttpClientOptions.onRetry`, when wired in - see `RetryCounter`. */
+  /** Network attempts and 429 retries observed via an injected `RequestCounter`. */
+  requests: number;
   retries429: number;
+  /**
+   * A snapshot read from `store` after the run, not a tally kept during it:
+   * the CLI should print what is actually on disk (including whatever
+   * earlier runs left there), not just what this run's own loop touched.
+   */
+  casesOnDisk: number;
+  pendingRows: number;
+  retryableCases: number;
+  retryableDocuments: number;
 }
 
 /**
- * A counter the caller wires into `HttpClientOptions.onRetry` so this run's
- * summary can report how many 429 retries it saw, without the orchestrator
+ * Thrown when a `CircuitBreakerError` aborts a run. Carries the `RunSummary`
+ * accumulated up to the abort point (see the `RunSummary.casesOnDisk`-style
+ * snapshot fields above) alongside the `cause`, so a caller can report exact
+ * numbers on an aborted run instead of only "it threw".
+ */
+export class RunAbortedError extends Error {
+  readonly summary: RunSummary;
+
+  constructor(cause: unknown, summary: RunSummary) {
+    super(`Run aborted: ${describeError(cause)}`, { cause });
+    this.name = 'RunAbortedError';
+    this.summary = summary;
+  }
+}
+
+/**
+ * Counter the caller wires into `HttpClientOptions.onRequest`/`onRetry` so
+ * this run's summary can report network activity without the orchestrator
  * needing to know anything about `HttpClient` itself.
  */
-export interface RetryCounter {
-  readonly count: number;
+export interface RequestCounter {
+  readonly requests: number;
+  readonly retries429: number;
 }
 
 export interface ScraperOptions {
   search: SearchFn;
-  detail: PjeDetail;
-  downloader: PjeDownloader;
+  detail: DetailFetcher;
+  downloader: DocumentDownloader;
   store: PersistenceStore;
   chain: PartitionChain;
   cover?: CoverFn;
   logger: LogSink;
   /** Dedup state across the run. Defaults to the store's own rebuilt seen-set when omitted. */
   seen?: SeenSet;
-  // TODO(9b): accept an `isCovered` predicate (from `store.rebuildCoveredPredicate()`)
-  // to skip windows a previous run already recorded as final, instead of re-walking them.
-  // TODO(9c): accept a `maxRequests` budget and stop the walk once it is spent.
-  retries429?: RetryCounter;
+  // TODO(9b): accept a `skipWindow?(query: Query): boolean` predicate (e.g.
+  // from `store.rebuildCoveredPredicate()`) and thread it into `sweep()` as a
+  // new `SweepOptions.skipWindow` - there is no pre-search "don't even run
+  // this query" hook in `sweep.ts` today, only post-hoc dedup via `seen`.
+  // TODO(9c): accept a `maxRequests` budget and stop the walk once
+  // `requestCounter.requests` reaches it.
+  requestCounter?: RequestCounter;
 }
 
 export class Scraper {
   private readonly search: SearchFn;
-  private readonly detail: PjeDetail;
-  private readonly downloader: PjeDownloader;
+  private readonly detail: DetailFetcher;
+  private readonly downloader: DocumentDownloader;
   private readonly store: PersistenceStore;
   private readonly chain: PartitionChain;
   private readonly cover: CoverFn | undefined;
   private readonly logger: LogSink;
   private readonly seen: SeenSet | undefined;
-  private readonly retries429: RetryCounter | undefined;
+  private readonly requestCounter: RequestCounter | undefined;
 
   constructor(options: ScraperOptions) {
     this.search = options.search;
@@ -116,7 +176,7 @@ export class Scraper {
     this.cover = options.cover;
     this.logger = options.logger;
     this.seen = options.seen;
-    this.retries429 = options.retries429;
+    this.requestCounter = options.requestCounter;
   }
 
   /** Runs the full sweep -> detail -> PDFs -> persistence flow for one date range. */
@@ -129,7 +189,12 @@ export class Scraper {
       documentsDownloaded: 0,
       documentsSkipped: 0,
       documentsFailed: 0,
+      requests: 0,
       retries429: 0,
+      casesOnDisk: 0,
+      pendingRows: 0,
+      retryableCases: 0,
+      retryableDocuments: 0,
     };
 
     try {
@@ -140,16 +205,30 @@ export class Scraper {
       // detail fetch or download did not itself turn into a recorded
       // failure) stops the run. Whatever persistence writes already
       // happened for earlier rows stand - only the walk itself unwinds.
+      await this.finalizeSummary(summary);
       this.logger.log({ kind: 'run-aborted', reason: describeError(error) });
-      summary.retries429 = this.retries429?.count ?? 0;
-      throw error;
+      throw new RunAbortedError(error, summary);
     }
 
-    summary.retries429 = this.retries429?.count ?? 0;
+    await this.finalizeSummary(summary);
     return summary;
   }
 
-  /** Step 1: walks the sweep, persisting every final event and logging every step. */
+  /** Fills in the request counters and the store-snapshot fields, success or abort alike. */
+  private async finalizeSummary(summary: RunSummary): Promise<void> {
+    summary.requests = this.requestCounter?.requests ?? 0;
+    summary.retries429 = this.requestCounter?.retries429 ?? 0;
+    summary.casesOnDisk = (await this.store.indexCases()).size;
+    summary.pendingRows = (await this.store.listPendingRows()).length;
+    summary.retryableCases = (await this.store.listRetryableCases()).length;
+    summary.retryableDocuments = (await this.store.listRetryableDocuments()).length;
+  }
+
+  /**
+   * Walks the sweep, persisting and detailing each final event's rows as
+   * they arrive - see the module comment on why detailing is interleaved
+   * with the walk rather than deferred to one pass at the end.
+   */
   private async runSweep(range: { from: string; to: string }, summary: RunSummary): Promise<void> {
     const seen = this.seen ?? (await this.store.rebuildSeenSet());
 
@@ -167,14 +246,18 @@ export class Scraper {
           summary.windows += 1;
           summary.casesListed += event.rows.length;
           await this.store.recordFinalEvent(event);
+          for (const row of event.rows) {
+            await this.processRow(row, summary);
+          }
         }
       }
     } catch (error) {
-      // A rejected query is a sweep-level failure worth recording and
-      // continuing past, not a reason to abort the whole run - the leaf that
-      // rejected simply contributes nothing. Anything else (a
-      // `CircuitBreakerError` in particular) is left to propagate: see the
-      // module comment's policy table.
+      // A rejected query ends the whole walk (`sweep()` catches nothing of
+      // its own - see that module's error-policy comment): there is no leaf
+      // to resume from here, only the run's root query to log against. See
+      // the module comment's policy table for why this is a known,
+      // documented gap rather than a silent one, and why per-leaf catching
+      // belongs to 9b rather than this PR.
       if (error instanceof RejectedQueryError) {
         this.logger.log({ kind: 'sweep-rejected', query: range, message: error.message });
         return;
@@ -183,17 +266,20 @@ export class Scraper {
     }
   }
 
-  /** Step 2+3: fetches detail and downloads documents for every row still pending. */
+  /**
+   * Processes every row still pending after the sweep: leftovers from an
+   * earlier run (resume, 9b), or from a `cover`'s own dedup. A row already
+   * in the case index still needs its documents re-attempted (see the
+   * module comment) before it can be safely dequeued.
+   */
   private async drainPendingRows(summary: RunSummary): Promise<void> {
     const caseIndex = await this.store.indexCases();
 
     for (const row of await this.store.listPendingRows()) {
-      if (caseIndex.has(row.number)) {
-        // Already detailed by an earlier pass over this same run (a
-        // re-listed window, e.g. a class-split re-covering a day). Dequeue
-        // without spending a detail fetch on it - see the store's own module
-        // comment for why `recordFinalEvent` cannot know this on its own.
-        await this.store.dequeueRow(row.number);
+      const stored = caseIndex.get(row.number);
+      if (stored !== undefined) {
+        await this.downloadDocuments(stored, summary);
+        await this.store.completeRow(stored);
         continue;
       }
 
@@ -201,7 +287,12 @@ export class Scraper {
     }
   }
 
-  /** Fetches one row's detail, then downloads its documents, recording failures as it goes. */
+  /**
+   * Fetches one row's detail, stores it (still pending), downloads its
+   * documents, then dequeues it with one final `completeRow` carrying the
+   * filled-in `localPath`s - see the module comment for why detail and the
+   * dequeue must not land in the same call.
+   */
   private async processRow(row: SearchResultRow, summary: RunSummary): Promise<void> {
     let legalCase: LegalCase;
     try {
@@ -209,13 +300,11 @@ export class Scraper {
     } catch (error) {
       // Only the circuit breaker aborts the run - see the module comment's
       // policy table. Everything else (ParseError, UnexpectedDetailPageError,
-      // a RateLimitError that exhausted HttpClient's own retries, a raw
-      // network error) is "the error persisted after several attempts": it
-      // is this row's problem, not the run's, so it is recorded and the walk
-      // continues to the next one.
-      if (error instanceof CircuitBreakerError) {
-        throw error;
-      }
+      // an exhausted RateLimitError, a raw network error) is "the error
+      // persisted after several attempts": it is this row's problem, not the
+      // run's, so it is recorded and the walk continues to the next one.
+      if (error instanceof CircuitBreakerError) throw error;
+
       const reason = describeError(error);
       await this.store.recordCaseFailure({
         caseNumber: row.number,
@@ -230,14 +319,11 @@ export class Scraper {
       return;
     }
 
-    await this.store.completeRow(legalCase);
+    await this.store.appendCase(legalCase);
     summary.casesDetailed += 1;
     this.logger.log({ kind: 'case-detailed', number: legalCase.number });
 
     await this.downloadDocuments(legalCase, summary);
-
-    // Re-persist the case so its documents' now-filled `localPath`s land -
-    // see the store's module comment on why `completeRow` is called twice.
     await this.store.completeRow(legalCase);
   }
 

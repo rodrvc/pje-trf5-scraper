@@ -1,8 +1,11 @@
 /**
- * Orchestrator tests: scripted fakes for search/detail/downloader, a real
- * temp-dir `PersistenceStore` (same style as `test/persistence-store.test.ts`),
- * no network. One test per row of the module's failure-policy table, plus
- * the happy path, the already-indexed-row dequeue, and the summary counts.
+ * Orchestrator tests: scripted fakes for search/detail/downloader (typed
+ * against the `DetailFetcher`/`DocumentDownloader` seams, not the concrete
+ * `PjeDetail`/`PjeDownloader`), a real temp-dir `PersistenceStore` (same
+ * style as `test/persistence-store.test.ts`), no network. One test per row
+ * of the module's failure-policy table, plus the happy path, the crash
+ * safety around detail-then-downloads, the already-indexed-row resume path,
+ * and the summary counts.
  */
 
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -15,9 +18,15 @@ import { CircuitBreakerError, ParseError, RateLimitError, RejectedQueryError, Un
 import type { CaseDocument, LegalCase, Query, SearchResponse, SearchResultRow } from '../src/domain/types.js';
 import { PersistenceStore } from '../src/persistence/store.js';
 import { DateRangeSplit, PartitionChain } from '../src/pipeline/partition.js';
-import { Scraper, type LogSink, type OrchestratorLogEvent } from '../src/pipeline/orchestrator.js';
-import type { PjeDetail } from '../src/pje/detail.js';
-import type { DownloadResult, PjeDownloader } from '../src/pje/download.js';
+import {
+  RunAbortedError,
+  Scraper,
+  type DetailFetcher,
+  type DocumentDownloader,
+  type LogSink,
+  type OrchestratorLogEvent,
+} from '../src/pipeline/orchestrator.js';
+import type { DownloadResult } from '../src/pje/download.js';
 
 function row(number: string): SearchResultRow {
   return { number, ca: `ca-${number}` };
@@ -72,8 +81,8 @@ function recordingLogger(): LogSink & { events: OrchestratorLogEvent[] } {
   };
 }
 
-/** Fakes `PjeDetail.fetch` with a scripted map keyed by `ca`, or a thrown error. */
-function fakeDetail(byCa: Record<string, LegalCase | Error>): PjeDetail {
+/** Fakes `DetailFetcher.fetch` with a scripted map keyed by `ca`, or a thrown error. */
+function fakeDetail(byCa: Record<string, LegalCase | Error>): DetailFetcher {
   return {
     async fetch(ca: string, _expectedNumber?: string): Promise<LegalCase> {
       const outcome = byCa[ca];
@@ -81,19 +90,33 @@ function fakeDetail(byCa: Record<string, LegalCase | Error>): PjeDetail {
       if (outcome instanceof Error) throw outcome;
       return outcome;
     },
-  } as unknown as PjeDetail;
+  };
 }
 
-/** Fakes `PjeDownloader.download` with a scripted map keyed by document id. */
-function fakeDownloader(byDocId: Record<string, DownloadResult>): PjeDownloader {
+/**
+ * Fakes `DocumentDownloader.download` with a scripted map keyed by document
+ * id. Records every call so a test can assert a document was (or was not)
+ * re-attempted. Mimics `PjeDownloader.download`'s own "already a valid file
+ * on disk" branch: a document that already carries a `localPath` is
+ * reported as a free, skipped success without consuming a script entry -
+ * exactly what makes re-running `downloadDocuments` over an already-indexed
+ * case cheap for its already-downloaded documents (see the module comment).
+ */
+function fakeDownloader(byDocId: Record<string, DownloadResult>): DocumentDownloader & { calls: string[] } {
+  const calls: string[] = [];
   return {
+    calls,
     async download(_caseNumber: string, document: CaseDocument, _ca?: string): Promise<DownloadResult> {
       const id = document.download.idProcessoDocumento;
+      calls.push(id);
+      if (document.localPath !== undefined) {
+        return { ok: true, path: document.localPath, bytes: 0, skipped: true };
+      }
       const outcome = byDocId[id];
       if (outcome === undefined) throw new Error(`fakeDownloader: no script for document="${id}"`);
       return outcome;
     },
-  } as unknown as PjeDownloader;
+  };
 }
 
 const RANGE = { from: '2025-03-05', to: '2025-03-05' };
@@ -111,7 +134,7 @@ describe('Scraper (orchestrator)', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('happy path: persists the case, downloads its documents, then re-persists with localPath', async () => {
+  it('happy path: persists the case, downloads its documents, then completes the row with localPath filled in', async () => {
     const search = async (_query: Query): Promise<SearchResponse> => response([row('case-a')]);
     const documents = [doc('d1')];
     const detail = fakeDetail({ 'ca-case-a': legalCase('case-a', documents) });
@@ -130,6 +153,8 @@ describe('Scraper (orchestrator)', () => {
       casesFailed: 0,
       documentsDownloaded: 1,
       documentsFailed: 0,
+      casesOnDisk: 1,
+      pendingRows: 0,
     });
 
     const stored = await store.indexCases();
@@ -139,22 +164,75 @@ describe('Scraper (orchestrator)', () => {
     expect(logger.events.some((e) => e.kind === 'document-downloaded')).toBe(true);
   });
 
-  it('dequeues a row already in the case index without a detail fetch', async () => {
-    // Pre-populate the case index as if an earlier pass in this same run
-    // already fetched it (e.g. a re-listed window).
-    await store.completeRow(legalCase('case-a'));
+  it('crash safety: the case is stored (still pending) before downloads, and dequeued only once after', async () => {
+    // A store wrapper that snapshots the case's own localPath at each call
+    // that writes it - appendCase (pre-download) and completeRow
+    // (post-download) - so the test can assert the ORDER: the first stored
+    // record has no localPath, the second (the one that also dequeues) does.
+    const localPathSnapshots: (string | undefined)[] = [];
+    const originalAppendCase = store.appendCase.bind(store);
+    const originalCompleteRow = store.completeRow.bind(store);
+    store.appendCase = async (legalCase: LegalCase) => {
+      localPathSnapshots.push(legalCase.documents[0]?.localPath);
+      return originalAppendCase(legalCase);
+    };
+    store.completeRow = async (legalCase: LegalCase) => {
+      localPathSnapshots.push(legalCase.documents[0]?.localPath);
+      return originalCompleteRow(legalCase);
+    };
+
+    const search = async (_query: Query): Promise<SearchResponse> => response([row('case-a')]);
+    const detail = fakeDetail({ 'ca-case-a': legalCase('case-a', [doc('d1')]) });
+    const downloader = fakeDownloader({
+      d1: { ok: true, path: '/data/pdfs/case-a/d1.pdf', bytes: 100, skipped: false },
+    });
+    const logger = recordingLogger();
+
+    const scraper = new Scraper({ search, detail, downloader, store, chain: noopChain(), logger });
+    await scraper.run(RANGE);
+
+    // The first write (appendCase, pre-download) carries no localPath yet;
+    // the second (completeRow, post-download, which also dequeues) does.
+    expect(localPathSnapshots).toEqual([undefined, '/data/pdfs/case-a/d1.pdf']);
+    expect(await store.listPendingRows()).toEqual([]);
+  });
+
+  it('resume: a row already in the case index re-attempts only its missing document, then dequeues', async () => {
+    // Simulate a case whose detail was already stored (with one document
+    // already downloaded) but whose row is still pending - the exact state
+    // a kill between "documents downloaded" and "final completeRow" would
+    // leave behind before this PR's fix, and the exact state a resumed run
+    // (9b) finds for a row an earlier run left mid-flight.
+    const documents = [
+      doc('d1', { localPath: '/data/pdfs/case-a/d1.pdf' }),
+      doc('d2'),
+    ];
+    await store.appendCase(legalCase('case-a', documents));
     await store.enqueueRow(row('case-a'));
 
     const search = async (_query: Query): Promise<SearchResponse> => response([]);
     const detail = fakeDetail({}); // no script: a call would throw and fail the test
-    const downloader = fakeDownloader({});
+    const downloader = fakeDownloader({
+      // d1 needs no script entry: fakeDownloader resolves it for free via
+      // its own localPath (mirroring PjeDownloader's real valid-file check)
+      // without ever consulting this map - so a passing test proves d1's
+      // "download" cost nothing beyond the check, matching the real one.
+      d2: { ok: true, path: '/data/pdfs/case-a/d2.pdf', bytes: 50, skipped: false },
+    });
     const logger = recordingLogger();
 
     const scraper = new Scraper({ search, detail, downloader, store, chain: noopChain(), logger });
     const summary = await scraper.run(RANGE);
 
-    expect(summary.casesDetailed).toBe(0);
+    expect(summary.casesDetailed).toBe(0); // no detail fetch: the case was already indexed
+    // Both documents are visited (d1's cheap, already-there skip included),
+    // but only d2 needed a real script entry to resolve.
+    expect(downloader.calls).toEqual(['d1', 'd2']);
+    expect(summary.documentsSkipped).toBe(1);
+    expect(summary.documentsDownloaded).toBe(1);
     expect(await store.listPendingRows()).toEqual([]);
+    const stored = await store.indexCases();
+    expect(stored.get('case-a')?.documents[1]?.localPath).toBe('/data/pdfs/case-a/d2.pdf');
   });
 
   it('policy: detail throws ParseError -> recordCaseFailure(retryable: true), continues to the next row', async () => {
@@ -213,7 +291,7 @@ describe('Scraper (orchestrator)', () => {
     expect(await store.hasCase('case-good')).toBe(true);
   });
 
-  it('policy: RejectedQueryError from search is recorded as a sweep failure, run continues', async () => {
+  it('policy: RejectedQueryError from search ends the sweep, logged as a sweep-level failure', async () => {
     const search = async (_query: Query): Promise<SearchResponse> => {
       throw new RejectedQueryError('rejected', 'server message');
     };
@@ -248,25 +326,28 @@ describe('Scraper (orchestrator)', () => {
     ]);
   });
 
-  it('policy: CircuitBreakerError aborts the run cleanly, rethrowing after finishing in-flight writes', async () => {
+  it('policy: CircuitBreakerError aborts the run cleanly, throwing RunAbortedError with the summary so far', async () => {
     const search = async (_query: Query): Promise<SearchResponse> => response([row('case-a')]);
     const detail = fakeDetail({ 'ca-case-a': legalCase('case-a', [doc('d1')]) });
-    const downloader = {
+    const downloader: DocumentDownloader = {
       async download(): Promise<DownloadResult> {
         throw new CircuitBreakerError('too many 429s');
       },
-    } as unknown as PjeDownloader;
+    };
     const logger = recordingLogger();
 
     const scraper = new Scraper({ search, detail, downloader, store, chain: noopChain(), logger });
 
-    await expect(scraper.run(RANGE)).rejects.toBeInstanceOf(CircuitBreakerError);
+    const error = await scraper.run(RANGE).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(RunAbortedError);
+    expect((error as RunAbortedError).cause).toBeInstanceOf(CircuitBreakerError);
+    expect((error as RunAbortedError).summary.casesDetailed).toBe(1);
     // The case detail itself was already persisted before the download step ran.
     expect(await store.hasCase('case-a')).toBe(true);
     expect(logger.events.some((e) => e.kind === 'run-aborted')).toBe(true);
   });
 
-  it('summary: counts windows, listed/detailed/failed cases and downloaded/skipped/failed documents', async () => {
+  it('summary: counts windows, listed/detailed/failed cases, downloaded/skipped/failed documents, and the on-disk snapshot', async () => {
     const search = async (_query: Query): Promise<SearchResponse> => response([row('case-a'), row('case-b')]);
     const detail = fakeDetail({
       'ca-case-a': legalCase('case-a', [doc('d1')]),
@@ -288,7 +369,12 @@ describe('Scraper (orchestrator)', () => {
       documentsDownloaded: 0,
       documentsSkipped: 1,
       documentsFailed: 0,
+      requests: 0,
       retries429: 0,
+      casesOnDisk: 1,
+      pendingRows: 0,
+      retryableCases: 1,
+      retryableDocuments: 0,
     });
   });
 });
