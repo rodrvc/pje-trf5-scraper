@@ -711,4 +711,78 @@ describe('Scraper (orchestrator)', () => {
     // ok: false - the run was interrupted, not a sign of a missing class.
     expect(check).toMatchObject({ kind: 'classSplitCheck', ok: undefined, incomplete: true });
   });
+
+  it('classSplitCheck: a skipped child (resume, 9b) suppresses the verdict instead of reporting a short sum as ok: false', async () => {
+    const classA: JudicialClass = { id: '1', name: 'Class A' };
+    const classB: JudicialClass = { id: '2', name: 'Class B' };
+    const chain = new PartitionChain([new DateRangeSplit(), new JudicialClassSplit([classA, classB])]);
+    const rows = (n: number, prefix: string): SearchResultRow[] =>
+      Array.from({ length: n }, (_, i) => row(`${prefix}-${i}`));
+
+    // Pre-record class A's window as already covered (as an earlier run
+    // would have left it), so this run's sweep skips it via skipWindow.
+    const classAQuery: Query = { from: '2025-03-05', to: '2025-03-05', judicialClassId: '1', judicialClassName: 'Class A' };
+    await store.recordFinalEvent({ type: 'window', query: classAQuery, rows: rows(25, 'a'), depth: 1 });
+
+    const search = async (query: Query): Promise<SearchResponse> => {
+      if (query.judicialClassId === undefined) return response(rows(30, 'day1'), true);
+      // Only class B's window is ever actually searched: class A is skipped.
+      return response(rows(5, 'b'));
+    };
+    const logger = recordingLogger();
+    const scraper = new Scraper({
+      search,
+      detail: fakeDetail({}),
+      downloader: fakeDownloader({}),
+      store,
+      chain,
+      logger,
+    });
+    await scraper.run(RANGE);
+
+    expect(logger.events.some((e) => e.kind === 'sweep' && e.event.type === 'skipped')).toBe(true);
+    const check = logger.events.find((e) => e.kind === 'classSplitCheck');
+    // Only class B's 5 rows were actually summed (class A was skipped, not
+    // searched) - far short of 30, but must NOT be reported as ok: false:
+    // the skipped child means this run's sum does not tell the whole story.
+    expect(check).toMatchObject({ kind: 'classSplitCheck', ok: undefined, incomplete: true });
+  });
+
+  it('retryFailed (9b): the budget gates its case/document retry loops too, stopping before the second failed case', async () => {
+    const search = async (): Promise<SearchResponse> => response([row('case-bad-1'), row('case-bad-2')]);
+    const failing: DetailFetcher = {
+      async fetch(): Promise<LegalCase> {
+        throw new ParseError('missing case number', 'missing case number');
+      },
+    };
+    const { scraper } = makeScraper({ search, detail: failing, downloader: fakeDownloader({}) });
+    await scraper.run(RANGE);
+    expect(await store.listRetryableCases()).toHaveLength(2);
+
+    const requestCounter = fakeRequestCounter();
+    let retryFetches = 0;
+    const detail: DetailFetcher = {
+      async fetch(): Promise<LegalCase> {
+        retryFetches += 1;
+        requestCounter.bump(1);
+        return legalCase(`case-bad-${retryFetches}`);
+      },
+    };
+    const bounded = new Scraper({
+      search,
+      detail,
+      downloader: fakeDownloader({}),
+      store,
+      chain: noopChain(),
+      logger: recordingLogger(),
+      requestCounter,
+      limits: { maxRequests: 1 },
+    });
+
+    const summary = await bounded.retryFailed();
+
+    expect(summary.stoppedBy).toBe('maxRequests');
+    expect(retryFetches).toBe(1); // only the first failed case was retried
+    expect(await store.listRetryableCases()).toHaveLength(1); // the second is still pending retry
+  });
 });
