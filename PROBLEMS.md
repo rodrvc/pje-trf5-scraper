@@ -119,8 +119,11 @@ split that day by judicial class.
 ### Cap detection
 
 Across 14 probes, `rows == 30` always came with the warning, and `< 30` never did.
-Even so the defensive condition **`rows >= 30 || warning present`** is used: if the
-cap ever arrived without a warning, the alternative is losing cases silently.
+The defensive condition **`rows >= 30 || warning present`** is used regardless:
+warning present means truncated for certain; exactly 30 rows with no warning means
+possibly complete (see "The warning means more-than-30, not exactly-30" below) but
+is still treated as capped, a cheap false positive traded against the alternative
+of losing cases silently if the warning ever failed to appear on a real cap.
 
 ### Approaches ruled out
 
@@ -190,16 +193,76 @@ rather than by a fixed number of probes. Note this axis is a **cover, not a
 partition**: the subsets overlap, so termination comes from the union ceasing to grow,
 not from disjointness. Deduplication by CNJ (already required) absorbs the overlap.
 
-### Correction: the cap warning was never observed to be absent
+### Correction: the judicial-class filter needs both the id AND the display name
 
-An earlier note recorded a leaf returning 30 rows *without* the truncation warning.
-**That could not be reproduced.** Re-probed across six saturating leaves
-(2025-03-11, 12, 13, 14, 18, 19, all with class 202): every one returned 30 rows
-**with** the warning present.
+While re-measuring for ISSUE-4b, a raw curl probe sending only
+`fPP:j_id189:sgbClasseJudicial_selection=202` (the internal class id) with
+`fPP:j_id189:classeJudicial` left **empty** returned the day's bare (unfiltered)
+result set instead of a class-202 one — i.e. the class filter was **silently
+ignored** when the id is sent without the display name. Every "day + class
+202" figure this section originally recorded from that probe was actually a
+day-only figure; the mistake reproduced identically three times before its
+cause was found.
 
-The defensive condition `rows >= 30 || warning present` stays, because a silent cap
-would create exactly the gap it guards against — but it is a precaution, not a
-response to observed behaviour.
+Re-probed sending **both** fields together
+(`sgbClasseJudicial_selection=202` and `classeJudicial=AGRAVO DE INSTRUMENTO`,
+exactly what `PjeSearch.buildFormBody` already sends — see `src/pje/search.ts`,
+which was never affected by this bug, since it always sets both fields):
+
+| Query | Rows | Capped? | Warning text? | Last row |
+|---|---|---|---|---|
+| 2025-03-12, no class | 30 | yes | **yes** | `0803807-42.2025.4.05.0000` |
+| 2025-03-12 + class 202 | 30 | yes | **no** | `0803864-60.2025.4.05.0000` |
+| 2025-03-11 + class 202 | 19 | no | — | — |
+
+The class filter is doing real work here: of the 30 rows returned for
+2025-03-12 + class 202, 12 do not appear at all in the 30 rows returned for
+2025-03-12 with no class filter — two genuinely different result sets, not a
+silently-dropped filter producing the same output twice. This is why
+`JudicialClassSplit` (`src/pipeline/partition.ts`) always sends both the id
+and the display name from the catalog entry: sending the id alone, which
+reads as "more specific," actually degrades silently into an unfiltered day
+query, which would make the sweep think a day was covered by class splits
+when the class dimension was never applied at all.
+
+**The third-dimension evidence above (2025-03-12 + class 202, the `DA
+S`/`DE A`/etc. table and the nine-filter union of 42) was measured correctly**
+and is unaffected by this bug — `PjeSearch.buildFormBody` sends both class
+fields, and only a hand-rolled curl probe missing the name field ever showed
+the wrong numbers. Re-confirmed live during ISSUE-4b (see its Resolution for
+the full digraph/trigram measurement built on this same leaf, reaching 46
+unique cases past the 30-row cap).
+
+### The warning means more-than-30, not exactly-30
+
+An earlier probe pass claimed the truncation warning is never absent from a
+30-row response: re-probing six leaves (2025-03-11, 12, 13, 14, 18, 19, all
+day-level, no class filter) always returned 30 rows **with** the warning
+present. That held because every one of those probes was day-level, and a
+day always has well over 30 cases behind it — those leaves were never at
+exactly 30.
+
+With the class filter actually applied, a different case shows up:
+2025-03-12 + class 202 hits exactly 30 rows **without** the warning, confirmed
+independently across multiple live probes (both raw curl and `PjeSearch`,
+see the class-filter correction above for the full table). The two
+observations are not in tension once read together: the warning text fires
+only when *more than* 30 rows would otherwise be returned, not whenever the
+30-row limit is hit. A leaf whose true total is exactly 30 saturates the
+display limit without ever crossing into "too many to show" territory
+server-side, so no warning appears — it is not "saturated" in the sense the
+rest of this section uses the word (there is nothing beyond the 30 shown),
+just exactly at the boundary.
+
+This means `rows >= 30 || warning present` has two distinct readings:
+warning present ⇒ truncated for sure, more cases exist beyond the 30 shown;
+30 rows with no warning ⇒ possibly complete, but still treated as capped by
+the rule. That is a cheap false positive: a leaf like this gets handed to
+`JudicialClassSplit`/`PartyTokenSweep` for nothing, costing a few wasted
+requests (the party-token cover plateaus almost immediately, `unionSize`
+barely moving past the seed), but it never drops a case. The rule stays
+exactly as specified — undercounting a real cap would be the opposite, and
+much worse, mistake.
 
 ---
 

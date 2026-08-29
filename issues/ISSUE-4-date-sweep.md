@@ -356,6 +356,13 @@ finding that 2025-03-11 + class 202 alone drops to 19, uncapped — but the
 cascade's third rung (ISSUE-4b) exists precisely because that is not
 guaranteed for every day/class combination.
 
+(Independently reconfirmed during ISSUE-4b: 2025-03-11 + class 202 still
+returns 19, uncapped, when both `sgbClasseJudicial_selection` (the id) and
+`classeJudicial` (the display name) are sent together - the server silently
+ignores the class filter if the id is sent without the name, which is why
+`buildFormBody`/`JudicialClassSplit` must always send both. See ISSUE-4b's
+Resolution for the full account of that bug.)
+
 This also confirms the acceptance criteria empirically: the 5-day range did
 split itself until windows stopped capping, the saturating day was split by
 class rather than recorded as lost, and every window (capped or not) produced

@@ -121,7 +121,7 @@ export class PjeSearch {
     body.set(FIELDS.caseNumber, '');
     body.set('mascaraProcessoReferenciaRadio', 'on');
     body.set(FIELDS.referenceCase, '');
-    body.set(FIELDS.partyName, '');
+    body.set(FIELDS.partyName, query.partyName ?? '');
     body.set(FIELDS.attorneyName, '');
     body.set(FIELDS.judicialClass, query.judicialClassName ?? '');
     body.set(FIELDS.judicialClassId, query.judicialClassId ?? '');
