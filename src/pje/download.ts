@@ -62,7 +62,7 @@ export interface DownloadSuccess {
  *
  * Never thrown: ISSUE-7/9 record failures from this discriminated result
  * rather than from a caught exception, and this module never writes
- * `data/failed.json` itself (that is ISSUE-7's file to own).
+ * `data/failed-documents.ndjson` itself (that is ISSUE-7's ledger to own).
  *
  * The one exception is a filesystem error while writing the file (a full
  * disk, a permissions problem): those propagate as a thrown exception rather

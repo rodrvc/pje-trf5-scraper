@@ -537,9 +537,12 @@ An explicit requirement of the brief. It must: detect the 429, retry with expone
 backoff, move on to the next document if it persists, and **record what failed** so it
 can be retried later.
 
-**No 429 was ever triggered during exploration**, so it cannot be demonstrated by
-provoking one against a real court's live site. The behaviour is verified with tests
-against a mock HTTP server instead.
+**No 429 was ever triggered during exploration**, so the behaviour could not be
+developed against a real one and is verified with tests against a mock HTTP server
+instead. It was later exercised for real, unprompted: the quick-start capture in
+`README.md` (a clean-clone run made after the code was finished) hit five
+consecutive 429s from the court server on its first request, and the retry loop
+waited each one out with the backoff shown before the search went through.
 
 A related case: an expired session can return 200 with HTML where a PDF was expected.
 That is not a 429, but it is a failure that must be detected so garbage is not written
@@ -549,7 +552,8 @@ to disk.
 detection). ISSUE-6 reuses it as-is for downloads, including a 429 on the
 download redirect's target, and demonstrates it with a 429-then-success test
 plus a retries-exhausted one asserting `retryable: true`. Failure recording
-(`data/failed.json`) is pending ISSUE-7.
+landed in ISSUE-7 as two append-only ledgers, `data/failed-cases.ndjson` and
+`data/failed-documents.ndjson`, re-read by `--retry-failed` (ISSUE-9).
 
 ---
 
