@@ -499,7 +499,11 @@ reusing it returns 404 even with the right cookie.
 This rules out the usual pattern of collecting every link and downloading them later
 in bulk: the redirect has to be followed there and then, with the session alive.
 
-**Status:** mechanism verified (a real PDF was downloaded) — pending ISSUE-6.
+**Status:** resolved in ISSUE-6. `src/pje/download.ts`'s `PjeDownloader`
+rebuilds the exact link, follows the redirect through `HttpClient.getBinary`
+in the same request (cookie jar intact), and never persists a `cid`. Verified
+again live: a 20,872-byte, 2-page PDF downloaded end-to-end for case
+0813029-18.2024.4.05.8100.
 
 ---
 
@@ -542,7 +546,10 @@ That is not a 429, but it is a failure that must be detected so garbage is not w
 to disk.
 
 **Status:** implemented in ISSUE-2 (backoff, circuit breaker, expired-session
-detection). Failure recording is pending ISSUE-7.
+detection). ISSUE-6 reuses it as-is for downloads, including a 429 on the
+download redirect's target, and demonstrates it with a 429-then-success test
+plus a retries-exhausted one asserting `retryable: true`. Failure recording
+(`data/failed.json`) is pending ISSUE-7.
 
 ---
 
