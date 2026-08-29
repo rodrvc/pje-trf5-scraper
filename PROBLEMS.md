@@ -560,4 +560,8 @@ show the scraper would get there if left running. That means being able to stop 
 pick up without repeating work: persisting progress, not re-downloading PDFs already
 fetched, and deduplicating cases that appear in more than one query.
 
-**Status:** pending ISSUE-7.
+**Status:** implemented in ISSUE-7 (`src/persistence/`) — append-only NDJSON
+stores for cases, the listed-but-not-detailed queue, sweep progress, and
+failed documents, each rebuilding its resume state from disk at startup. See
+the issue resolution for file formats and the exact resume semantics; wiring
+these stores into the actual sweep/detail/download loop is ISSUE-9.
