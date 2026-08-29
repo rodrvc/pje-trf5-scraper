@@ -12,7 +12,7 @@ ISSUE-4 partitions by date and then by judicial class. When one day + one class
 still returns 30 rows, that leaf is the bottom of the disjoint tree — and part of
 the corpus sits behind it. This issue reaches it.
 
-Depends on ISSUE-4 (the `PartitionStrategy` chain).
+Depends on ISSUE-4 (the `sweep()` walk and its `cover` hook).
 
 ## The finding this rests on
 
@@ -39,12 +39,29 @@ Full evidence in `PROBLEMS.md` §5.
 
 ## Scope
 
-Implement `PartyTokenSweep` as a third `PartitionStrategy`, chained after
-`JudicialClassSplit`.
+Implement `PartyTokenSweep` as the `cover` hook ISSUE-4's `sweep()` accepts
+(`src/pipeline/sweep.ts`'s `SweepOptions.cover`, of type `CoverFn`), invoked on
+every leaf the `PartitionChain` cannot narrow any further.
 
-**It is a cover, not a partition.** This is the design constraint that makes it
-different in kind from the other two strategies, and it must be visible in the
-code rather than buried:
+**It is a cover, not a partition, and it is *not* a `PartitionStrategy`.** This
+is a correction from the original design in this issue: a `PartitionStrategy`'s
+`split(query): Query[]` is synchronous and cannot see the search responses of
+the subqueries it produces, but `PartyTokenSweep` needs exactly that feedback -
+each filter's response tells it whether the union grew, which is what decides
+both the *next* filter to try and *when to stop*. `PartitionChain` stays closed
+over `PartitionStrategy` (a provable, disjoint partition); this cover is a
+structurally different kind of narrowing and lives in its own seam instead:
+
+    cover?: (leaf: Query, first: SearchResponse, search: SearchFn) => AsyncGenerator<SweepEvent>
+
+`sweep()` calls it exactly where it would otherwise emit `unsplittable`,
+passing the leaf query, the already-fetched first response (so the cover does
+not repeat that request), and the `search` function to run its own probes
+with. It must end with exactly one `covered` (`{ query, rows, depth,
+filtersTried, unionSize, plateaued: true }`) or `abandoned` (`{ query, rows,
+depth, filtersTried, unionSize }`, budget exhausted before plateau) event.
+
+The distinction that matters is unchanged, only relocated:
 
 - `DateRangeSplit` and `JudicialClassSplit` produce **disjoint** subqueries whose
   union is the parent by construction. Recursion terminates when none caps, and
