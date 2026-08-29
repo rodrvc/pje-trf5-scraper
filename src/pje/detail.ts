@@ -92,8 +92,11 @@ export class PjeDetail {
     const classification = classifyDetailPage(html);
 
     if (classification.kind === 'sealed') {
+      // A sealed page shows no CNJ number, so the only one we have is the
+      // search row's. Without it the case would be indexed under an empty
+      // key (`CaseStore` is keyed by number) and logged as `case  detailed`.
       return {
-        number: '',
+        number: expectedNumber ?? '',
         ca,
         activeParties: [],
         passiveParties: [],
