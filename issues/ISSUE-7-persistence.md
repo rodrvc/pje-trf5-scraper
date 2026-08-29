@@ -148,21 +148,72 @@ individual store also has its own idempotent-append test
 
 ### `PersistenceStore` façade — method list
 
-    appendCase(legalCase)                    indexCases()                  hasCase(number)
-    enqueueRow(row)                          dequeueRow(number)            listPendingRows()
-    recordSweepEvent(event)                  rebuildSeenSet()              rebuildCoveredPredicate()
-    recordDocumentFailure(record)            recordDocumentSuccess(caseNumber, documentId)
-    listRetryableDocuments()
+    appendCase(legalCase)          indexCases()                    hasCase(number)
+    completeRow(legalCase)         enqueueRow(row)                 dequeueRow(number)
+    listPendingRows()              recordFinalEvent(event)         rebuildSeenSet()
+    rebuildCoveredPredicate()      recordDocumentFailure(record)   recordDocumentSuccess(case, doc)
+    listRetryableDocuments()       recordCaseFailure(record)       recordCaseSuccess(caseNumber)
+    listRetryableCases()
 
 A short usage sketch (sweep → persist → detail → documents → retry) is in the
 module's own comment (`src/persistence/store.ts`).
 
+### Architecture-review follow-up
+
+A review before merge found three crash windows that could still silently
+lose data, plus one missing ledger:
+
+- **Torn-tail-poisons-next-append**: `appendLine` now truncates any torn
+  trailing line left by an earlier interrupted write *before* appending, so
+  a new record never gets concatenated onto old garbage. Only the last
+  4KB-and-doubling window is read to find where to truncate, not the whole
+  file - the first version of this fix read the entire file on every single
+  append, turning a run's worth of appends quadratic; fixed once the
+  regression showed up in the 10k-line benchmark (3.9s → ~2s).
+- **Middle-line corruption was silently skipped**: `readLines` now tolerates
+  an unparseable line only when it is the file's last non-empty line (a
+  plausible torn write); any earlier line that fails to parse throws
+  `ParseError` instead of being dropped, since it cannot be a torn write - a
+  completed write is always followed by another only once it, too, is whole.
+- **A kill between recording a window covered and enqueuing its rows lost
+  cases**: `recordFinalEvent(event)` now enqueues every row first, then
+  records the event; `completeRow(legalCase)` appends the case first, then
+  dequeues its row. Both orderings mean the worst a kill can do is repeat
+  already-idempotent work, never skip it. The former two-call sequence
+  (`recordSweepEvent` + a loop of `enqueueRow`, `appendCase` +
+  `dequeueRow`) is no longer the documented flow.
+- **Failed detail fetches had nowhere to land**: `PendingStore` dequeues a
+  row on any attempt, success or failure, so a case whose detail fetch threw
+  used to vanish with no record anywhere. `FailureLedger` (`failure-ledger.ts`)
+  generalises the failure/success/latest-wins logic out of
+  `FailedDocumentStore` into a reusable, string-keyed ledger; `CaseStore`'s
+  companion `CaseFailureStore` (`data/failed-cases.ndjson`, keyed by bare
+  case number) uses the same ledger to cover this gap, exposing
+  `recordCaseFailure`/`recordCaseSuccess`/`listRetryableCases` alongside the
+  document-shaped equivalents.
+
+Also done: `CaseStore` caches its index in memory after the first disk read
+and updates it on every `append`, instead of re-reading the whole file on
+every `has()`/`index()` call; `readLines` streams with `readline` instead of
+`readFile` + `split`; the PIPE_BUF atomicity claim in `ndjson-log.ts`'s
+module comment was corrected to "a torn line is possible and handled," since
+that guarantee is for pipes, not regular files; `windowKey` documents why
+`judicialClassName` is excluded from the key.
+
 ### Verification
 
-`npm test`: **208 tests green** (179 baseline + 32 new across
+`npm test`: **211 tests green** (179 baseline + 35 net new across
 `ndjson-log.test.ts`, `case-store.test.ts`, `pending-store.test.ts`,
 `sweep-progress-store.test.ts`, `failed-document-store.test.ts`,
-`persistence-store.test.ts`, minus 3 removed with `uncoverable.test.ts`).
+`persistence-store.test.ts`, `failure-ledger.test.ts`,
+`case-failure-store.test.ts`, minus 3 removed with `uncoverable.test.ts`).
+Generic failure-ledger semantics (non-retryable exclusion, success clears a
+failure, a later failure re-adds it, distinct keys stay independent, restart
+survives) are tested once at the `FailureLedger` level; the document and
+case stores' own tests check only their store-specific wiring (key
+composition, flattening `detail` back into the caller-facing shape) instead
+of re-testing the same generic behaviour twice.
+
 `npm run typecheck` clean. No network was used — every test runs against a
 temp directory (`mkdtemp`), removed in `afterEach`. `data/` is confirmed
 already gitignored (`.gitignore` line 8).
@@ -172,10 +223,8 @@ already gitignored (`.gitignore` line 8).
 - Wiring `PersistenceStore` into the actual sweep/detail/download loop (this
   issue only builds and tests the stores themselves).
 - The `--retry-failed` CLI flag (ISSUE-8) and the failure-policy decision of
-  *when* to call `recordDocumentFailure` vs. retry in-process (ISSUE-9's
-  "explicit failure policy").
-- Deciding, per detail-fetch failure, whether it belongs in a case-level
-  failed-record too (this issue only specified failed *documents*, per the
-  brief's explicit ask; a symmetric case-level failure ledger was judged out
-  of scope until ISSUE-9 shows it is actually needed, to avoid building a
-  second failure format nothing calls yet).
+  *when* to call `recordDocumentFailure`/`recordCaseFailure` vs. retry
+  in-process (ISSUE-9's "explicit failure policy").
+- Deciding exactly when a case's row should be `completeRow`'d versus left
+  pending until its documents finish downloading (the façade documents both
+  orders as valid; ISSUE-9 picks one).
