@@ -52,6 +52,12 @@
  * `downloadDocuments` first (cheap for whatever already downloaded - see
  * `PjeDownloader.download`'s own valid-file check - and real work for
  * whatever did not) and only then `completeRow`'d.
+ *
+ * `retryFailed()` (9b) uses `appendCase` instead of `completeRow` for both
+ * retry paths: a retried case/document was never enqueued in `PendingStore`
+ * for this attempt, so there is no row to dequeue - `completeRow` would
+ * write a meaningless line to `dequeued.ndjson` for a row that was never
+ * pending.
  */
 
 import type { CaseDocument, LegalCase, SearchResultRow } from '../domain/types.js';
@@ -89,6 +95,10 @@ export interface LogSink {
 /** Tallies produced by one run, printed by the CLI (ISSUE-8). */
 export interface RunSummary {
   windows: number;
+  /** Leaves skipped via `skipWindow` (9b: resume) - already covered by an earlier run. */
+  windowsSkipped: number;
+  /** Leaves abandoned per-leaf after `search` threw `RejectedQueryError` (9b). */
+  windowsRejected: number;
   casesListed: number;
   casesDetailed: number;
   casesFailed: number;
@@ -238,8 +248,11 @@ export class Scraper {
         for (const row of event.rows) {
           await this.processRow(row, summary);
         }
+        continue;
       }
-      // `skipped`/`rejected` (9b) carry no rows: nothing further to persist.
+      // `skipped`/`rejected` (9b) carry no rows: nothing to persist, just tally.
+      if (event.type === 'skipped') summary.windowsSkipped += 1;
+      if (event.type === 'rejected') summary.windowsRejected += 1;
     }
   }
 
@@ -324,66 +337,98 @@ export class Scraper {
   /** Downloads every document of one case, recording each outcome. */
   private async downloadDocuments(legalCase: LegalCase, summary: RunSummary): Promise<void> {
     for (const doc of legalCase.documents) {
-      const result = await this.attemptDownload(legalCase, doc);
-
-      if (result.ok) {
-        doc.localPath = result.path;
-        await this.store.recordDocumentSuccess(legalCase.number, doc.download.idProcessoDocumento);
-        if (result.skipped) {
-          summary.documentsSkipped += 1;
-        } else {
-          summary.documentsDownloaded += 1;
-        }
-        this.logger.log({
-          kind: 'document-downloaded',
-          caseNumber: legalCase.number,
-          documentId: doc.download.idProcessoDocumento,
-          skipped: result.skipped,
-        });
-        continue;
-      }
-
-      await this.store.recordDocumentFailure({
-        caseNumber: legalCase.number,
-        documentId: doc.download.idProcessoDocumento,
-        downloadRef: doc.download,
-        reason: result.reason,
-        ...(result.status !== undefined ? { httpStatus: result.status } : {}),
-        attempt: result.sessionAttempts,
-        retryable: result.retryable,
-      });
-      summary.documentsFailed += 1;
-      this.logger.log({
-        kind: 'document-failed',
-        caseNumber: legalCase.number,
-        documentId: doc.download.idProcessoDocumento,
-        reason: result.reason,
-      });
+      await this.downloadOne(legalCase, doc, summary);
     }
+  }
+
+  /**
+   * Downloads one document and records the outcome. Factored out of
+   * `downloadDocuments` so `retryFailedDocument` (9b) can re-attempt exactly
+   * one document by reference, without constructing a partial-case view
+   * that would silently drop the case's other documents if `LegalCase` were
+   * ever cloned instead of spread.
+   *
+   * `attemptOverride` lets `retryFailedDocument` supply the failure ledger's
+   * own cross-run attempt count and the `MAX_RETRY_ATTEMPTS` cap instead of
+   * `attemptDownload`'s per-call `sessionAttempts`/`retryable` (which only
+   * knows about this one call, not the document's retry history).
+   */
+  private async downloadOne(
+    legalCase: LegalCase,
+    doc: CaseDocument,
+    summary: RunSummary,
+    attemptOverride?: { attempt: number; retryable: boolean },
+  ): Promise<void> {
+    const result = await this.attemptDownload(legalCase, doc);
+
+    if (result.ok) {
+      doc.localPath = result.path;
+      await this.store.recordDocumentSuccess(legalCase.number, doc.download.idProcessoDocumento);
+      if (result.skipped) {
+        summary.documentsSkipped += 1;
+      } else {
+        summary.documentsDownloaded += 1;
+      }
+      this.logger.log({
+        kind: 'document-downloaded',
+        caseNumber: legalCase.number,
+        documentId: doc.download.idProcessoDocumento,
+        skipped: result.skipped,
+      });
+      return;
+    }
+
+    await this.store.recordDocumentFailure({
+      caseNumber: legalCase.number,
+      documentId: doc.download.idProcessoDocumento,
+      downloadRef: doc.download,
+      reason: result.reason,
+      ...(result.status !== undefined ? { httpStatus: result.status } : {}),
+      attempt: attemptOverride?.attempt ?? result.sessionAttempts,
+      retryable: attemptOverride?.retryable ?? result.retryable,
+    });
+    summary.documentsFailed += 1;
+    this.logger.log({
+      kind: 'document-failed',
+      caseNumber: legalCase.number,
+      documentId: doc.download.idProcessoDocumento,
+      reason: result.reason,
+    });
   }
 
   /**
    * `--retry-failed` (9b): re-attempts every case whose detail fetch
    * previously failed and every document whose download previously failed -
-   * a second pass over the two failure ledgers, no sweep involved.
+   * a second pass over the two failure ledgers, no sweep involved. Wrapped
+   * like `run()`: a `CircuitBreakerError` aborts cleanly with the summary
+   * accumulated so far, same `RunAbortedError` the sweep path throws.
    *
-   * A retried case goes through the same store flow as a fresh row
-   * (`appendCase` pending, download, `completeRow`), then `recordCaseSuccess`
-   * clears it from the ledger. A retried document re-attempts only that one
-   * (see `retryFailedDocument`), and only if its case is still on disk - a
-   * missing case would mean the case store was tampered with, not a normal
-   * retry scenario, so it is skipped rather than guessed at.
+   * A retried case goes through the same store flow as a fresh row minus
+   * the pending queue, which it was never on - `appendCase` (not
+   * `completeRow`, which would dequeue a row that was never enqueued and
+   * write a meaningless line to `dequeued.ndjson`), download, then
+   * `recordCaseSuccess` clears it from the ledger. A retried document
+   * re-attempts only that one (see `retryFailedDocument`), and only if its
+   * case is still on disk - a missing case would mean the case store was
+   * tampered with, not a normal retry scenario, so it is skipped rather than
+   * guessed at.
    */
   async retryFailed(): Promise<RunSummary> {
     const summary = emptySummary();
 
-    for (const failedCase of await this.store.listRetryableCases()) {
-      await this.retryFailedCase(failedCase, summary);
-    }
+    try {
+      for (const failedCase of await this.store.listRetryableCases()) {
+        await this.retryFailedCase(failedCase, summary);
+      }
 
-    const caseIndex = await this.store.indexCases();
-    for (const failedDocument of await this.store.listRetryableDocuments()) {
-      await this.retryFailedDocument(failedDocument, caseIndex, summary);
+      const caseIndex = await this.store.indexCases();
+      for (const failedDocument of await this.store.listRetryableDocuments()) {
+        await this.retryFailedDocument(failedDocument, caseIndex, summary);
+      }
+    } catch (error) {
+      await this.finalizeSummary(summary);
+      this.logger.log({ kind: 'run-aborted', reason: describeError(error) });
+      throw new RunAbortedError(error, summary);
     }
 
     await this.finalizeSummary(summary);
@@ -399,12 +444,13 @@ export class Scraper {
       if (error instanceof CircuitBreakerError) throw error;
 
       const reason = describeError(error);
+      const attempt = failed.attempt + 1;
       await this.store.recordCaseFailure({
         caseNumber: failed.caseNumber,
         ca: failed.ca,
         reason,
-        attempt: failed.attempt + 1,
-        retryable: true,
+        attempt,
+        retryable: attempt < MAX_RETRY_ATTEMPTS,
       });
       summary.casesFailed += 1;
       this.logger.log({ kind: 'case-failed', number: failed.caseNumber, reason });
@@ -416,7 +462,7 @@ export class Scraper {
     this.logger.log({ kind: 'case-detailed', number: legalCase.number });
 
     await this.downloadDocuments(legalCase, summary);
-    await this.store.completeRow(legalCase);
+    await this.store.appendCase(legalCase);
     await this.store.recordCaseSuccess(legalCase.number);
   }
 
@@ -430,17 +476,21 @@ export class Scraper {
     const doc = legalCase?.documents.find((d) => d.download.idProcessoDocumento === failed.documentId);
     if (legalCase === undefined || doc === undefined) return;
 
-    // A single-document view: downloadDocuments iterates `.documents`, so
-    // narrowing it here re-attempts only this document, not the case's others.
-    await this.downloadDocuments({ ...legalCase, documents: [doc] }, summary);
-    await this.store.completeRow(legalCase);
+    const attempt = failed.attempt + 1;
+    await this.downloadOne(legalCase, doc, summary, { attempt, retryable: attempt < MAX_RETRY_ATTEMPTS });
+    await this.store.appendCase(legalCase);
   }
 }
+
+/** Cross-run retry cap for both failure ledgers: the third failure stops further retries. */
+const MAX_RETRY_ATTEMPTS = 3;
 
 /** A zeroed `RunSummary`, shared by `run()` and `retryFailed()` so their starting tallies never drift apart. */
 function emptySummary(): RunSummary {
   return {
     windows: 0,
+    windowsSkipped: 0,
+    windowsRejected: 0,
     casesListed: 0,
     casesDetailed: 0,
     casesFailed: 0,

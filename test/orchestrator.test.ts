@@ -364,6 +364,8 @@ describe('Scraper (orchestrator)', () => {
 
     expect(summary).toEqual({
       windows: 1,
+      windowsSkipped: 0,
+      windowsRejected: 0,
       casesListed: 2,
       casesDetailed: 1,
       casesFailed: 1,
@@ -483,7 +485,39 @@ describe('Scraper (orchestrator)', () => {
     expect(summary).toMatchObject({ documentsDownloaded: 1, documentsFailed: 0 });
     expect(await store.listRetryableDocuments()).toEqual([]);
     const stored = await store.indexCases();
-    const d1 = stored.get('case-a')?.documents.find((d) => d.download.idProcessoDocumento === 'd1');
+    const storedDocs = stored.get('case-a')?.documents ?? [];
+    // The stored case still carries BOTH documents, and d2's own localPath -
+    // set by the first run, well before this retry ever touched d1 - is
+    // untouched: retrying one document must never lose or overwrite another.
+    expect(storedDocs).toHaveLength(2);
+    const d1 = storedDocs.find((d) => d.download.idProcessoDocumento === 'd1');
+    const d2 = storedDocs.find((d) => d.download.idProcessoDocumento === 'd2');
     expect(d1?.localPath).toBe('/data/pdfs/case-a/d1.pdf');
+    expect(d2?.localPath).toBe('/data/pdfs/case-a/d2.pdf');
+  });
+
+  it('retryFailed (9b): a case failing again increments attempt, and the third failure is no longer retryable', async () => {
+    const search = async (): Promise<SearchResponse> => response([row('case-bad')]);
+    const detail: DetailFetcher = {
+      async fetch(): Promise<LegalCase> {
+        throw new ParseError('missing case number', 'missing case number');
+      },
+    };
+    const { scraper } = makeScraper({ search, detail, downloader: fakeDownloader({}) });
+    await scraper.run(RANGE);
+
+    let [record] = await store.listRetryableCases();
+    expect(record).toMatchObject({ attempt: 1, retryable: true });
+
+    await scraper.retryFailed();
+    [record] = await store.listRetryableCases();
+    expect(record).toMatchObject({ attempt: 2, retryable: true });
+
+    await scraper.retryFailed();
+    const stillRetryable = await store.listRetryableCases();
+    // The third failure (attempt 3) is no longer retryable, so it drops out
+    // of the retryable list entirely - listRetryable only returns records
+    // whose latest attempt is still marked retryable.
+    expect(stillRetryable).toEqual([]);
   });
 });

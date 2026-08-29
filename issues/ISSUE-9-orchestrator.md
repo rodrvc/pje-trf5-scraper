@@ -195,3 +195,19 @@ clean.
 
 **Deferred to 9c**: request budgets (`maxRequests`) and any other run-limit
 policy, and `scripts/smoke-orchestrator.ts`.
+
+**Review follow-up** (architecture review of the part 2 PR): `retryFailed()`
+now calls `appendCase` instead of `completeRow` (no row was ever pending for
+a retry, so `completeRow`'s dequeue would write a meaningless line to
+`dequeued.ndjson`). `downloadOne` is extracted from `downloadDocuments`'s
+loop and called directly by both the fresh-row and retry-document paths - no
+single-document object-spread view, so a document is re-attempted strictly
+by reference. Both retry paths now compute `attempt: failed.attempt + 1` and
+`retryable: attempt < MAX_RETRY_ATTEMPTS` (a documented constant, `3`),
+closing the previous gap where nothing ever stopped retrying a permanently
+broken case or document. `retryFailed()` is wrapped like `run()`: a
+`CircuitBreakerError` aborts cleanly with `RunAbortedError`. `RunSummary`
+gains `windowsSkipped`/`windowsRejected`, fed from the sweep's `skipped`/
+`rejected` events. `SweepProgressStore.rebuildCoveredPredicate()` now
+excludes `abandoned` leaves (kept in the seen set) - a cover's incomplete
+leaf must be re-attempted by a later run, not skipped forever.

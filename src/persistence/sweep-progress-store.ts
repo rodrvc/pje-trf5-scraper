@@ -170,7 +170,15 @@ export class SweepProgressStore {
    */
   async rebuildCoveredPredicate(): Promise<(query: Query) => boolean> {
     const records = await this.all();
-    const covered = new Set(records.map((record) => windowKey(record.query)));
+    // `abandoned` leaves are deliberately excluded (9b): a cover (ISSUE-4b)
+    // gave up on that leaf's union before it plateaued, so the leaf is
+    // known-incomplete, not covered - treating it as covered here would let
+    // `skipWindow` (orchestrator.ts) skip it forever, even on a later run
+    // with a bigger cover budget that could finish the job. Its rows are
+    // still in the seen set (`rebuildSeenSet`), so dedup is unaffected.
+    const covered = new Set(
+      records.filter((record) => record.type !== 'abandoned').map((record) => windowKey(record.query)),
+    );
     return (query: Query) => covered.has(windowKey(query));
   }
 }

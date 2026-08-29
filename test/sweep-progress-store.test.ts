@@ -106,6 +106,28 @@ describe('SweepProgressStore', () => {
     expect(isCovered({ ...classQuery, judicialClassId: '283' })).toBe(false);
   });
 
+  it('excludes abandoned leaves from the covered predicate, so they are re-attempted on the next run (9b)', async () => {
+    const store = new SweepProgressStore(dir);
+    await store.recordEvent({
+      type: 'abandoned',
+      query: classQuery,
+      rows: [row('a')],
+      depth: 1,
+      filtersTried: 26,
+      unionSize: 1,
+    });
+
+    const isCovered = await store.rebuildCoveredPredicate();
+    // Unlike window/unsplittable/covered, an abandoned leaf is known
+    // incomplete: a later run (possibly with a bigger cover budget) must
+    // still walk into it rather than skip it forever.
+    expect(isCovered(classQuery)).toBe(false);
+
+    // Its rows are still registered as seen, so dedup is unaffected.
+    const seen = await store.rebuildSeenSet();
+    expect(seen.has('a')).toBe(true);
+  });
+
   it('absorbs the abandoned-leaf record format previously covered by pipeline/uncoverable.ts', async () => {
     const store = new SweepProgressStore(dir);
     const abandoned: SweepEvent = {
