@@ -105,7 +105,7 @@ the client/session layering in ISSUE-2:
 
 **Never writes `data/failed.json`.** `download()` returns a discriminated
 `DownloadResult` (`{ ok: true, path, bytes, skipped }` |
-`{ ok: false, reason, status?, retryable, attempts }`); ISSUE-7/9 own
+`{ ok: false, reason, status?, retryable, sessionAttempts }`); ISSUE-7/9 own
 recording failures from it.
 
 ### Traps found while building this
@@ -116,16 +116,55 @@ recording failures from it.
   extracts and is not what this module downloads; only the `idBin=`-bearing
   `href` matters. Worth noting because grepping the fixture for `.seam?ca=`
   alone would have pointed at the wrong link.
-- `JsfSession.http` is private, by design (transport is not meant to leak past
-  the protocol layer). `PjeDownloader` takes `HttpClient` as its own
-  constructor dependency instead of reaching through `session` - keeps the
-  dependency explicit and avoids widening `JsfSession`'s public surface for
-  one caller.
+
+### Post-review fixes
+
+An architecture review of the first version of this PR requested two
+before-merge fixes and several cheap improvements, all applied on the same
+branch:
+
+- **Path traversal.** `sanitiseSegment()` kept dots (needed for CNJ numbers),
+  which let a segment that was only dots (`.`, `..`) survive unchanged -
+  `caseDir(rootDir, '..')` could then resolve outside `rootDir`. Fixed: a
+  trimmed segment that is only dots now collapses to `_`. The readable "kind"
+  segment is also now capped at 80 characters - `nomeArqProcDocBin` is
+  server-supplied and unbounded, and a full path past ~255 bytes fails with
+  `ENAMETOOLONG` on a real filesystem. Windows reserved device names are
+  explicitly out of scope, noted in the module comment.
+- **The redirect-target 429 now has its own permanent test**, chaining
+  302→`cid=1`→429, then a retry that 302s to a fresh `cid=2`→200, asserting
+  both cids were actually hit - not just the document URL 429ing. The 429
+  tests also wire `onRetry` into the client and assert on `attempt` numbers
+  and `delayMs`, so they demonstrate the backoff actually ran rather than
+  merely that a retry eventually succeeded.
+- **`JsfSession.getBinary(view, query?, headers?)`** was added, mirroring
+  `get`/`post`. `PjeDownloader` now depends only on `session`, never on a
+  separately-passed `HttpClient` - the previous two-dependency constructor
+  let a caller pair a download with a client that was not the one behind that
+  session's cookie jar, which is exactly the mismatch that makes a `cid` 404.
+- `reestablish()`'s own `RateLimitError`/`CircuitBreakerError` are now caught
+  and mapped the same way as the initial request's; a genuine filesystem
+  error from `writeAtomically` still propagates as a thrown exception, now
+  documented as deliberate (an I/O error is not a retry-ledger item).
+- The failure result's attempt counter is renamed `sessionAttempts` and
+  documented as counting re-establish attempts, not underlying HTTP retries
+  (those are `HttpClient`'s own concern and can be many per session attempt).
+- The interrupted-write test now stubs `FileHandle.prototype.writeFile` to
+  reject, so it exercises a write failing mid-stream rather than an `open()`
+  failure on the temp path.
+- `scripts/smoke-download.ts` stays as a committed tool (not a throwaway),
+  its header states the ~5-request cost, it has an `npm run smoke:download`
+  script, and `scripts/**` is now in the `tsconfig.json` `include` so it is
+  typechecked.
+
+Re-verified live after the refactor: same case and document
+(0813029-18.2024.4.05.8100, Despacho, 2025-07-25), same 20,872 bytes.
 
 ### Verification
 
-`npm test`: **197 tests green** (18 new: 10 in `test/download.test.ts`, 8 in
-`test/pdf-naming.test.ts`), no network. `npm run typecheck`: clean.
+`npm test`: **200 tests green** (21 new: 11 in `test/download.test.ts`, 10 in
+`test/pdf-naming.test.ts`), no network. `npm run typecheck`: clean, including
+`scripts/**`.
 
 **Live smoke** (`scripts/smoke-download.ts`, `delayMs: 1500`): searched
 2026-01-05..2026-01-06 (30 rows, capped), opened the first case with
