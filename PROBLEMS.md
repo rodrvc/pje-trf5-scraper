@@ -201,6 +201,29 @@ The defensive condition `rows >= 30 || warning present` stays, because a silent 
 would create exactly the gap it guards against — but it is a precaution, not a
 response to observed behaviour.
 
+### ISSUE-4b: the corpus behind a saturated leaf is not static
+
+Re-measuring the same four leaves from the "third dimension" table above, months
+later (2026-08-28), against the live server:
+
+| Leaf (+ class 202) | Unfiltered rows now | Capped now? |
+|---|---|---|
+| 2025-03-11 | 19 | no |
+| 2025-03-12 | 30 | yes |
+| 2025-03-14 | 14 | no |
+| 2025-03-19 | 17 | no |
+
+Only 2025-03-12 still saturates; the other three no longer do. PJe TRF5 is a live
+production system: cases filed under a fixed date + class window can be reassigned
+between classes, or otherwise move, well after the date they were filed under. A
+union measured against one of these leaves is only ever a snapshot of that leaf's
+corpus **at measurement time** — a filter alphabet chosen and validated on one day
+is not guaranteed to reproduce the exact same union size on another. This is why
+`ISSUE-4b`'s cover reports `covered`/`abandoned` per run rather than asserting a
+fixed expected union size, and why its own resolution documents this measurement
+alongside the token alphabet decision. See `issues/ISSUE-4b-party-sweep.md`'s
+Resolution for the full live comparison and the party-token alphabet this drove.
+
 ---
 
 ## 6. The case detail paginates internally
