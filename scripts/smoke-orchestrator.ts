@@ -102,7 +102,12 @@ async function main() {
       log: (event) =>
         console.log(
           event.kind === 'sweep'
-            ? JSON.stringify({ kind: 'sweep', type: event.event.type, query: event.event.query, rows: event.event.rows.length })
+            ? JSON.stringify({
+                kind: 'sweep',
+                type: event.event.type,
+                query: event.event.query,
+                rows: 'rows' in event.event ? event.event.rows.length : undefined,
+              })
             : JSON.stringify(event),
         ),
     },
