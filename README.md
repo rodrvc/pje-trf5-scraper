@@ -62,8 +62,8 @@ one, splitting along three dimensions in cascade:
 3. **Party-name substring tokens** — when a single day + class leaf *still* saturates
 
 The second dimension proved essential: probing March 2025, **6 out of 13 days hit the
-cap on their own**. The third dimension is different in kind from the first two: date
-and class splits are disjoint partitions whose completeness is proved by construction
+cap on their own** (`docs/probe-pagination.sh` reproduces the measurement). The third
+dimension is different in kind from the first two: date and class splits are disjoint partitions whose completeness is proved by construction
 (recursion stops when no half saturates), while "Nome da parte" is a `LIKE %token%`
 substring match, so filters *overlap* and the resulting subsets are a **cover, not a
 partition**. Completeness there is measured, not proved: a leaf is accepted once the
@@ -79,6 +79,7 @@ Requires Node.js 20 or newer.
 
 ```bash
 npm install
+npm test   # 243 tests, no network needed
 ```
 
 ## Quick start
@@ -90,30 +91,45 @@ npm run scrape -- --from=2025-03-05 --to=2025-03-05
 ```
 
 This prints the range and limits, one line per event as the run progresses, and a
-summary block at the end:
+summary block at the end. The capture below is a real run from a clean clone
+(abridged: most of the 17 `pdf ... saved` lines collapsed). It happened to hit a genuine burst of
+`429`s on the very first request, which is the retry loop doing its job — five
+backoff waits, then the search went through:
 
 ```
 range: 2025-03-05..2025-03-05
 limits: maxRequests=40, maxCases=3, delayMs=1500, retryFailed=false
-09:14:02 search 2025-03-05 -> 10 rows
-09:14:04 case 0803807-42.2025.4.05.0000 detailed
-09:14:06 pdf 0803807-42.2025.4.05.0000 doc 123456 saved
+01:03:16 429 -> waiting 1.1s (attempt 1)
+01:03:18 429 -> waiting 2.4s (attempt 2)
+01:03:22 429 -> waiting 5.1s (attempt 3)
+01:03:27 429 -> waiting 8.4s (attempt 4)
+01:03:36 429 -> waiting 20.3s (attempt 5)
+01:04:04 search 2025-03-05 -> 10 rows
+01:04:07 case 0000462-42.2023.8.17.3480 detailed
+01:04:09 pdf 0000462-42.2023.8.17.3480 doc 2268615 saved
+01:04:10 pdf 0000462-42.2023.8.17.3480 doc 2268614 saved
+01:04:12 pdf 0000462-42.2023.8.17.3480 doc 2268705 saved
+01:04:19 case 0800577-15.2025.4.05.8302 detailed
+...
+01:04:53 pdf 0803385-67.2025.4.05.0000 doc 2683265 saved
 --- run summary ---
 windows: 1
 cases listed: 10
 cases detailed: 3
 cases failed: 0
-documents downloaded: 22
+documents downloaded: 17
 documents skipped: 0
 documents failed: 0
 requests: 40
-429 retries: 0
+429 retries: 5
 cases on disk: 3
 pending rows: 8
 retryable cases: 0
 retryable documents: 0
 stopped by: maxRequests
 ```
+
+Re-running the same command picks up the 8 pending rows (see "Resuming" below).
 
 By default a run is **bounded**: `--max-requests` (default 40) and `--max-cases`
 (default 3) stop it well short of a full crawl, so it is safe to run repeatedly
@@ -200,13 +216,14 @@ headers that never arrive. Details and evidence for each of these in
 The detail parser (`classifyDetailPage()` in `src/domain/parse-detail.ts`) only
 classifies a case as sealed when the page's own notice panel contains the site's
 wording ("segredo de justiça" / "autos sigilosos") — never from the mere absence of
-the usual case-data heading. A sealed case is stored with `sealed: true` and whatever
-partial data the page still shows.
+the usual case-data heading. A sealed case is stored as a `sealed: true` record with
+no parties, movements or documents, and no further requests are made for it.
 
 This is deliberately not the same code path as a broken response: a database error
 page or a dropped session also lacks the usual heading but carries none of that
-wording, and is classified `unexpected` instead, which the orchestrator retries or
-records as a failure rather than silently treating as a real sealed case. See
+wording, and is classified `unexpected` instead: the orchestrator records it as a
+retryable failure (re-attempted with `--retry-failed`) rather than silently treating
+it as a real sealed case. See
 `PROBLEMS.md` §6 for the live case that motivated the distinction.
 
 ## Output format

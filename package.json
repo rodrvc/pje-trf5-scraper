@@ -1,7 +1,7 @@
 {
   "name": "pje-trf5-scraper",
   "version": "1.0.0",
-  "description": "Scraper de la Consulta Pública del PJe del TRF5. HTTP puro, sin automatización de navegador.",
+  "description": "Scraper for the TRF5 PJe public case search. Plain HTTP, no browser automation.",
   "license": "MIT",
   "private": true,
   "type": "module",
