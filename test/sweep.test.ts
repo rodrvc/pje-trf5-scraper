@@ -51,13 +51,34 @@ describe('sweep', () => {
 
     expect(calls).toEqual([
       { from: '2025-03-11', to: '2025-03-12' },
-      { from: '2025-03-11', to: '2025-03-11' },
       { from: '2025-03-12', to: '2025-03-12' },
+      { from: '2025-03-11', to: '2025-03-11' },
     ]);
 
     const leafEvents = events.filter((e) => e.type === 'window' && !e.capped);
     expect(leafEvents).toHaveLength(2);
     expect(events.some((e) => e.type === 'window' && e.capped)).toBe(true);
+  });
+
+  it('covers the most recent day first, not the earliest, for a multi-day range', async () => {
+    // The requirement is "walk from the present backwards": a short or
+    // interrupted run should still have covered the latest slice of the
+    // range. Assert directly on event order, not just on which queries ran.
+    const search = async (query: Query): Promise<SearchResponse> => {
+      if (query.from === query.to) return response([row(`case-${query.from}`)], false);
+      return response([row('case-range')], true);
+    };
+
+    const events = await collect(
+      sweep({ from: '2025-03-11', to: '2025-03-12', search, chain: chain() }),
+    );
+
+    const finalWindows = events.filter(
+      (e) => e.type === 'window' && !e.capped,
+    ) as Extract<SweepEvent, { type: 'window'; capped: false }>[];
+
+    expect(finalWindows[0]?.query).toEqual({ from: '2025-03-12', to: '2025-03-12' });
+    expect(finalWindows[1]?.query).toEqual({ from: '2025-03-11', to: '2025-03-11' });
   });
 
   it('splits by class when a single day caps under dates alone', async () => {
@@ -102,10 +123,18 @@ describe('sweep', () => {
     }
   });
 
-  it('deduplicates rows by CNJ number across overlapping windows', async () => {
+  it('deduplicates rows by CNJ number across final events only', async () => {
     // Same case surfaces both under the bare (capped) day and under one of its
     // class splits, which is the realistic scenario the cap-then-split walk
-    // produces: the capped-day event and the class window can share rows.
+    // produces: the capped-day event and a class window can share rows.
+    //
+    // Only final events (window/capped:false, unsplittable) count for
+    // deduplication and for "what the run actually found" - a capped window's
+    // rows are informational only (see SweepEvent's doc comment), so
+    // `day-only`, which this fake never returns again once it is split, is
+    // legitimately absent from the final output: that gap is exactly what the
+    // further splits (or, if none applied, the `unsplittable` event) exist to
+    // surface, not something this test should paper over.
     const search = async (query: Query): Promise<SearchResponse> => {
       if (query.judicialClassId === undefined) {
         return response([row('shared'), row('day-only')], true);
@@ -120,14 +149,53 @@ describe('sweep', () => {
       sweep({ from: '2025-03-11', to: '2025-03-11', search, chain: chain() }),
     );
 
-    const allNumbers = events.flatMap((e) => e.rows.map((r) => r.number));
+    const finalEvents = events.filter((e) => e.type === 'unsplittable' || !e.capped);
+    const finalNumbers = finalEvents.flatMap((e) => e.rows.map((r) => r.number));
     const counts = new Map<string, number>();
-    for (const n of allNumbers) counts.set(n, (counts.get(n) ?? 0) + 1);
+    for (const n of finalNumbers) counts.set(n, (counts.get(n) ?? 0) + 1);
 
     expect(counts.get('shared')).toBe(1);
-    expect(counts.get('day-only')).toBe(1);
+    expect(counts.get('day-only')).toBeUndefined();
     expect(counts.get('class-202-only')).toBe(1);
     expect(counts.get('class-283-only')).toBe(1);
+
+    // The capped (non-final) window still carries its raw rows, unaffected by
+    // dedup against later final events - it is informational, not truncated.
+    const cappedEvent = events.find((e) => e.type === 'window' && e.capped);
+    expect(cappedEvent?.rows.map((r) => r.number).sort()).toEqual(['day-only', 'shared']);
+  });
+
+  it('does not treat a capped window as final: its rows still reach the child final event', async () => {
+    // A capped window's rows must be informational only, not "seen". If the
+    // walk registered them as seen at the capped event, the child's identical
+    // rows would look like duplicates and get silently dropped - exactly the
+    // trap the issue's own framing warns about ("a capped query is a signal
+    // to narrow, not a result").
+    const search = async (query: Query): Promise<SearchResponse> => {
+      if (query.judicialClassId === undefined) {
+        // The bare day caps, and (unrealistically, but this is the point)
+        // returns exactly the same rows every child will also return.
+        return response([row('shared-a'), row('shared-b')], true);
+      }
+      if (query.judicialClassId === '202') {
+        return response([row('shared-a'), row('shared-b')], false);
+      }
+      return response([], false);
+    };
+
+    const events = await collect(
+      sweep({ from: '2025-03-11', to: '2025-03-11', search, chain: chain() }),
+    );
+
+    const cappedEvent = events.find((e) => e.type === 'window' && e.capped);
+    expect(cappedEvent?.rows.map((r) => r.number).sort()).toEqual(['shared-a', 'shared-b']);
+
+    const class202Event = events.find(
+      (e) => e.type === 'window' && !e.capped && e.query.judicialClassId === '202',
+    );
+    // The child's final event still carries both rows: they were not marked
+    // "seen" by the parent's (non-final) capped event.
+    expect(class202Event?.rows.map((r) => r.number).sort()).toEqual(['shared-a', 'shared-b']);
   });
 
   it('logs an event for every window covered, including capped intermediate ones', async () => {

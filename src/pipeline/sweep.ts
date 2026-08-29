@@ -14,7 +14,24 @@
 import type { Query, SearchResponse, SearchResultRow } from '../domain/types.js';
 import type { PartitionChain } from './partition.js';
 
-/** One step of the walk: either a completed window, or a warning about one. */
+/**
+ * One step of the walk: either a completed window, or a warning about one.
+ *
+ * Only two variants are **final**: `window` with `capped: false`, and
+ * `unsplittable`. Their `rows` are deduplicated against every other final
+ * event in the run and are the actual answer for that slice of the query
+ * space.
+ *
+ * `window` with `capped: true` is **not final** - the issue's own framing is
+ * that "a capped query is a signal to narrow, not a result". Its `rows` are
+ * carried only for auditability (e.g. to show what the last row was before
+ * the split, per PROBLEMS.md §5's ordering note) and are deliberately **not**
+ * deduplicated against: the same cases will reappear in the children's final
+ * events, and a consumer that materializes results must not treat a capped
+ * window's rows as part of the output, or it will double-count and could
+ * even (if it also marked them "seen") make the real, final sighting of those
+ * cases look like a duplicate to be dropped.
+ */
 export type SweepEvent =
   | {
       /** A window ran and did not saturate: its rows are the final answer for it. */
@@ -25,7 +42,11 @@ export type SweepEvent =
       depth: number;
     }
   | {
-      /** A window saturated and was narrowed further; carried for auditability. */
+      /**
+       * A window saturated and was narrowed further. `rows` here are
+       * informational only (see the type-level doc above): the same cases are
+       * re-emitted, deduplicated, by this window's children.
+       */
       type: 'window';
       query: Query;
       rows: SearchResultRow[];
@@ -60,14 +81,18 @@ export interface SweepOptions {
  *
  * Depth-first (rather than breadth-first) means a short or interrupted run
  * still produces a run of complete, contiguous windows near one end of the
- * range instead of a scattering of half-finished ones - and here specifically
- * it means the most recent slice of the range is covered first, per the
- * "walk from the present backwards" requirement.
+ * range instead of a scattering of half-finished ones. The walk here simply
+ * consumes each strategy's subqueries in the order `split()` returns them -
+ * it does not itself reorder anything - so "from the present backwards" is
+ * guaranteed by `DateRangeSplit.split()` returning the later half first (see
+ * its doc comment), not by this function.
  *
- * Deduplicates by CNJ number across the whole run: different windows (in
- * particular, class-split windows over the same day) can surface the same
- * case, and the acceptance criteria call for one entry per case, not per
- * window it appeared in.
+ * Deduplicates by CNJ number across the whole run, but only at **final**
+ * events (`window` with `capped: false`, and `unsplittable` - see
+ * `SweepEvent`'s doc comment for why a capped window's rows must not be
+ * registered as seen): different windows (in particular, class-split windows
+ * over the same day) can surface the same case, and the acceptance criteria
+ * call for one entry per case, not per window it appeared in.
  *
  * An async generator was chosen over an event callback for three reasons:
  *
@@ -95,20 +120,33 @@ export async function* sweep(options: SweepOptions): AsyncGenerator<SweepEvent> 
 
   async function* walk(query: Query, depth: number): AsyncGenerator<SweepEvent> {
     const response = await search(query);
-    const rows = deduplicate(response.rows, seen);
 
     if (!response.capped) {
-      yield { type: 'window', query, rows, capped: false, depth };
+      // Final event: dedupe against, and register into, the run-wide seen set.
+      yield { type: 'window', query, rows: deduplicate(response.rows, seen), capped: false, depth };
       return;
     }
 
     const strategy = chain.applicable(query);
     if (strategy === undefined) {
-      yield { type: 'unsplittable', query, rows, depth };
+      // Also final: this leaf's rows are the actual (incomplete-by-chain)
+      // answer for it, so they must be deduplicated and registered too.
+      yield { type: 'unsplittable', query, rows: deduplicate(response.rows, seen), depth };
       return;
     }
 
-    yield { type: 'window', query, rows, capped: true, depth, splitBy: strategy.name };
+    // Not final: rows are carried raw, informational only, and deliberately
+    // NOT registered into `seen` - the same cases resurface, deduplicated, in
+    // the children below. Registering them here would make those children's
+    // genuine (final) sightings look like duplicates and drop them silently.
+    yield {
+      type: 'window',
+      query,
+      rows: response.rows,
+      capped: true,
+      depth,
+      splitBy: strategy.name,
+    };
 
     for (const subquery of strategy.split(query)) {
       yield* walk(subquery, depth + 1);
@@ -116,7 +154,7 @@ export async function* sweep(options: SweepOptions): AsyncGenerator<SweepEvent> 
   }
 }
 
-/** Keeps only rows whose CNJ number has not been yielded by an earlier window. */
+/** Keeps only rows whose CNJ number has not been yielded by an earlier final event. */
 function deduplicate(rows: SearchResultRow[], seen: Set<string>): SearchResultRow[] {
   const fresh: SearchResultRow[] = [];
   for (const row of rows) {
