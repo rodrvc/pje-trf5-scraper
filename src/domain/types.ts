@@ -104,6 +104,15 @@ export interface Query {
   judicialClassId?: string;
   /** Class name, which the form requires alongside the id. */
   judicialClassName?: string;
+  /**
+   * Party name filter, for the third dimension (ISSUE-4b).
+   *
+   * Not an exact-name lookup: the server runs `LIKE %token% AND LIKE %token%`
+   * against whitespace-separated tokens (PROBLEMS.md §5, "The third
+   * dimension"). The server requires at least two tokens; a single token (or
+   * an empty string) is rejected with `RejectedQueryError`.
+   */
+  partyName?: string;
 }
 
 /** Outcome of running a query. */
