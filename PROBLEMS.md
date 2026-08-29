@@ -271,11 +271,26 @@ much worse, mistake.
 The detail view opens with a GET using a `ca=` token carried by each result row. It
 returns case data, parties with CPF/CNPJ/OAB, movements and attached documents.
 
-But parties and movements are paginated **within** the page (65 movements in one test
-case). The first HTML does not carry everything; those paginators must be walked.
+But all four of those tables (active parties, passive parties, movements,
+documents) can each be paginated **within** the page (75 movements and 20
+documents in one test case, both split across several pages). The first HTML
+does not carry everything; those paginators must be walked.
 
-**Resolution:** they are `Richfaces.Datascroller` components. Changing page is
-another AJAX POST shaped like this:
+**Correction: two different RichFaces widgets do the paging, not one.**
+
+An earlier pass of this work read only the parties tables as the reference and
+concluded movements had "no pager at all" when a case's movements fit on one
+page — true for the parties tables' `Richfaces.Datascroller`, but movements
+and documents on this site paginate with a **different** component,
+`Richfaces.Slider` (a 1..maxValue drag control), whenever there is more than
+one page. A single fixture (`test/fixtures/detail-with-pagination.html`) shows
+both side by side: 12 passive parties across 2 datascroller pages, 75
+movements across 5 slider pages, 20 documents across 2 more. The first
+implementation only recognised the datascroller, which silently truncated
+movements and documents down to whatever fit on page 1 — a real data-loss bug,
+not a documented behaviour, caught in review.
+
+The datascroller's paging POST:
 
     AJAXREQUEST=_viewRoot
     <baseId>=<baseId>                 # scroller id without the trailing suffix
@@ -284,10 +299,41 @@ another AJAX POST shaped like this:
     ajaxSingle=<scrollerId>
     AJAX:EVENTS_COUNT=1
 
-Verified: moving to page 2 of the active parties does change the participant list.
-The scroller ids (one per table: active parties, passive parties, movements) are read
-from the detail markup, and the page count comes from the paginator itself
-(`«« « 1 2 3 ... » »»`).
+Verified: moving to page 2 of the passive parties changes the participant list,
+and the response's row ids confirm it (see below).
+
+The slider's registration looks like:
+
+    new Richfaces.Slider("j_id146:j_id561:j_id562",
+      {'minValue':'1','maxValue':'5', ...,
+       'onchange':'A4J.AJAX.Submit(\'j_id146:j_id561\', event,
+         {..., parameters:{\'j_id146:j_id561:j_id563\':\'j_id146:j_id561:j_id563\'} ...})' })
+
+`j_id562` (the slider's own id) is a real, named `<input>` field whose value is
+the current page; `j_id563` is a separate, self-referential id the `onchange`
+event names, parallel to the datascroller's `ajaxSingle`. **Unresolved:** a
+POST built from exactly these pieces (`AJAXREQUEST=_viewRoot`, the base form
+id, `<sliderId>=<page>`, `<eventId>=<eventId>`, `AJAX:EVENTS_COUNT=1` — and
+variants adding `containerId`, the enclosing form's other hidden fields, or
+`ajaxSingle` on the event id instead) got a 200 every time but with
+`Ajax-Update-Ids content=""`: the server accepted the request and rendered
+nothing. Ten live requests were spent on this (five GET+POST pairs) without
+success; a genuine page-2 movements response was never captured. The
+implementation (`buildPagingBody()` in `src/pje/detail.ts`) is the best
+reconstruction available, exercised only against a hand-derived fixture in
+tests, not a live one. Whoever picks up ISSUE-9 should verify this against the
+live site before trusting it for a real run — see this issue's own note and
+ISSUE-5's Resolution.
+
+Neither the "N resultados encontrados" total the page declares for each table,
+nor the requirement that a page actually moved (both enforced now, see below),
+were caught by an earlier version of this code — a data-loss bug like the
+slider one would have passed silently.
+
+The pager ids (one per table: active parties, passive parties, movements,
+documents) are read from the detail markup, and the page count comes from
+`maxValue` (slider) or the paginator's own numbered links (datascroller,
+`«« « 1 2 3 ... » »»`).
 
 Note: the detail page's ViewState differs from the search one and must be refreshed
 with every response.
@@ -302,17 +348,38 @@ So `ca=` is a stable case identifier, not a conversation token like the PDF `cid
 (problem 7). **It can be persisted for resuming**: picking up a run does not require
 re-running the search to reach an already-listed case.
 
-**Status:** resolved — implemented in ISSUE-5 (`src/pje/detail.ts`,
-`src/domain/parse-detail.ts`).
+**Status:** implemented in ISSUE-5 (`src/pje/detail.ts`,
+`src/domain/parse-detail.ts`); the slider paging POST is not confirmed live
+(see above) and should be treated as unverified until it is.
 
-### A single-page table's scroller markup is not always the same shape
+### A single-page table's pager markup is not always the same shape
 
 Confirmed while implementing ISSUE-5: parties tables always render a
 `<div class="rich-datascr">` for their scroller, hidden and with no page links
-when there is only one page. Movements, in every case sampled, rendered **no
-scroller registration at all** when there was only one page — not even a
-hidden one. Both must be read as "one page, nothing to walk", but the second
-case has no scroller id to name at all, unlike the first.
+when there is only one page. Movements and documents, in every single-page
+case sampled, rendered **no pager registration at all** — not even a hidden
+one. Both must be read as "one page, nothing to walk", but the second case has
+no pager id to name at all, unlike the first.
+
+### Every table's declared total and every paging response are now cross-checked
+
+Two defensive checks added after the truncation bug above, both in
+`src/domain/parse-detail.ts` / `src/pje/detail.ts`:
+
+- The page itself declares a total ("N resultados encontrados") for each
+  table; after walking every page, the collected row count must equal it
+  (`assertTotalMatches`), or `ParseError` is thrown. This is what would have
+  caught the original truncation directly (75 declared, 15 collected).
+- Every row's id embeds its absolute position in the whole table (page 2 of a
+  12-row passive-parties table starts at index 10, not 0). If a paging POST
+  is silently ignored by the server (stale ViewState, a wrong field id after a
+  redeploy) it can return page 1 again with a 200 and no error; the response's
+  first row index is checked against where the requested page should start
+  (`assertPageAdvanced` in `src/pje/detail.ts`), or `ParseError` is thrown.
+  Without this, a silently-ignored page would duplicate rows undetected.
+
+A hard ceiling (500 pages) also guards against a bogus pager read turning into
+a request storm.
 
 ### `nomeArqProcDocBin` is percent-encoded in latin-1, not UTF-8
 
@@ -325,17 +392,46 @@ does) silently corrupts every accented file name. Handled explicitly in
 `decodeLatin1QueryValue()`, reading the raw query string instead of relying on
 `URLSearchParams` for that one field.
 
-### A server error can look exactly like a sealed case
+### A server error looks exactly like a sealed case unless told apart on purpose
 
 While sampling live cases for a segredo de justiça example (17 candidates,
 none sealed), one (`0804011-36.2025.4.05.8100`) returned a genuine
 PostgreSQL error page — `cannot execute UPDATE in a read-only transaction`,
 raised from `ProcessoDocumentoBinHome` while rendering the document panel —
-instead of the detail view. It is a real server bug, not a sealed case, but it
-shares the one signal `isSealed()` uses (no "Dados do Processo" heading), so it
-is read as sealed too. Both are treated the same way on purpose — "detail
-unavailable, not an error" — but it means that flag does not distinguish the
-two causes.
+instead of the detail view. It is a real server bug, not a sealed case, and
+the first version of this code read both the same way, since both lack the
+"Dados do Processo" heading. That silently turned a failure into what looked
+like valid, sealed-case data — never retried, never logged as broken.
+
+**Fixed:** `classifyDetailPage()` (`src/domain/parse-detail.ts`) is now
+three-way, not a boolean. Sealed requires the site's own positive wording
+("segredo de justiça" / "autos sigilosos") — the missing heading alone is not
+enough. Anything else missing the heading (a database error page, a changed
+layout) is classified `unexpected` with a short reason, and `PjeDetail.fetch`
+throws `UnexpectedDetailPageError` for it instead of returning a fabricated
+`sealed: true`. The orchestrator (ISSUE-9) decides whether to retry or record
+it as a failure; that decision does not belong in the parser.
+
+A second, separate bug in the same function: the sealed wording was originally
+matched against the **whole page's text**, not just the notice panel. A
+movement description like "pedido de segredo de justiça indeferido" (a request
+for secrecy that was *denied*) is a common, entirely ordinary entry in a
+public case; matching free text anywhere would have misread that case as
+sealed and discarded real data. Fixed by scoping the match to
+`dl.rich-messages` / `span.rich-messages-label`, the same notice block
+`parse-results.ts` already reads server rejections from.
+
+**Which layer catches a dropped session, and where:** `JsfSession.post()`
+already detects an expired session on the detail view using this same
+"missing heading" signal (`looksLikeExpiredSession`, `src/pje/session.ts`) and
+retries once by re-establishing the session before giving up. But
+`PjeDetail.fetch`'s very first request is a `session.open()` **GET**, and
+`open()` never runs that check — only `post()` does. So a session dropped
+before the first GET of a detail page is not caught by `JsfSession` at all; it
+falls through to `classifyDetailPage()`, which (correctly, now) reports it as
+`unexpected` rather than misreading it as sealed. The distinction matters for
+ISSUE-9: this specific failure mode needs a fresh session and a retried
+`fetch()`, not a "give up, it's sealed" outcome.
 
 ---
 
