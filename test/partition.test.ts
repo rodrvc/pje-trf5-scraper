@@ -10,37 +10,37 @@ describe('DateRangeSplit', () => {
     expect(strategy.canSplit({ from: '2025-03-11', to: '2025-03-11' })).toBe(false);
   });
 
-  it('splits a two-day range into two single days', () => {
+  it('splits a two-day range into two single days, later day first', () => {
     const query: Query = { from: '2025-03-11', to: '2025-03-12' };
     expect(strategy.canSplit(query)).toBe(true);
     expect(strategy.split(query)).toEqual([
-      { from: '2025-03-11', to: '2025-03-11' },
       { from: '2025-03-12', to: '2025-03-12' },
+      { from: '2025-03-11', to: '2025-03-11' },
     ]);
   });
 
-  it('halves an odd-length range giving the extra day to the first half', () => {
+  it('halves an odd-length range giving the extra day to the earlier half, later half first', () => {
     // 2025-03-01..2025-03-05 is 5 days: mid should split 3/2, never an empty half.
     const query: Query = { from: '2025-03-01', to: '2025-03-05' };
-    const [first, second] = strategy.split(query);
-    expect(first).toEqual({ from: '2025-03-01', to: '2025-03-03' });
-    expect(second).toEqual({ from: '2025-03-04', to: '2025-03-05' });
+    const [later, earlier] = strategy.split(query);
+    expect(later).toEqual({ from: '2025-03-04', to: '2025-03-05' });
+    expect(earlier).toEqual({ from: '2025-03-01', to: '2025-03-03' });
   });
 
-  it('crosses a month boundary correctly', () => {
+  it('crosses a month boundary correctly, later half first', () => {
     const query: Query = { from: '2025-02-27', to: '2025-03-02' };
-    const [first, second] = strategy.split(query);
-    // 4 days total (27, 28, 01, 02): first half gets the extra day.
-    expect(first).toEqual({ from: '2025-02-27', to: '2025-02-28' });
-    expect(second).toEqual({ from: '2025-03-01', to: '2025-03-02' });
+    const [later, earlier] = strategy.split(query);
+    // 4 days total (27, 28, 01, 02): earlier half gets the extra day.
+    expect(later).toEqual({ from: '2025-03-01', to: '2025-03-02' });
+    expect(earlier).toEqual({ from: '2025-02-27', to: '2025-02-28' });
   });
 
-  it('handles the leap day correctly (2024 is a leap year)', () => {
+  it('handles the leap day correctly (2024 is a leap year), later half first', () => {
     const query: Query = { from: '2024-02-28', to: '2024-03-01' };
-    const [first, second] = strategy.split(query);
-    // 3 days total (28, 29, 01): first half gets the extra day.
-    expect(first).toEqual({ from: '2024-02-28', to: '2024-02-29' });
-    expect(second).toEqual({ from: '2024-03-01', to: '2024-03-01' });
+    const [later, earlier] = strategy.split(query);
+    // 3 days total (28, 29, 01): earlier half gets the extra day.
+    expect(later).toEqual({ from: '2024-03-01', to: '2024-03-01' });
+    expect(earlier).toEqual({ from: '2024-02-28', to: '2024-02-29' });
   });
 
   it('does not treat 2025 (non-leap) as having a Feb 29', () => {
@@ -48,8 +48,8 @@ describe('DateRangeSplit', () => {
     // Feb 28 -> Mar 1 is a 2-day range, not 3.
     const query: Query = { from: '2025-02-28', to: '2025-03-01' };
     expect(strategy.split(query)).toEqual([
-      { from: '2025-02-28', to: '2025-02-28' },
       { from: '2025-03-01', to: '2025-03-01' },
+      { from: '2025-02-28', to: '2025-02-28' },
     ]);
   });
 

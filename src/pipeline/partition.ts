@@ -78,6 +78,11 @@ function fromEpochDay(day: number): string {
  * Not splittable once the range is a single day (`from === to`): there is
  * nothing left to halve along this axis, and the next strategy in the chain
  * must take over.
+ *
+ * **Ordering: the later half is returned first.** The sweep is required to
+ * walk "from the present backwards" so a short or interrupted run still
+ * covers recent cases; since the walk consumes each strategy's output in
+ * order, the order is decided right here rather than left to the caller.
  */
 export class DateRangeSplit implements PartitionStrategy {
   readonly name = 'date-range';
@@ -100,10 +105,11 @@ export class DateRangeSplit implements PartitionStrategy {
     // never produces an empty half.
     const mid = from + Math.floor((to - from) / 2);
 
-    return [
-      { ...query, from: fromEpochDay(from), to: fromEpochDay(mid) },
-      { ...query, from: fromEpochDay(mid + 1), to: fromEpochDay(to) },
-    ];
+    const earlier = { ...query, from: fromEpochDay(from), to: fromEpochDay(mid) };
+    const later = { ...query, from: fromEpochDay(mid + 1), to: fromEpochDay(to) };
+
+    // Later half first: see the ordering note above.
+    return [later, earlier];
   }
 }
 
