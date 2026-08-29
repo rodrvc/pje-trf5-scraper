@@ -86,7 +86,16 @@ export function isFinalSweepEvent(
   return FINAL_KINDS.has(event.type);
 }
 
-/** Stable key for a query's window, used both for the covered-set and the SeenSet dedup. */
+/**
+ * Stable key for a query's window, used for the covered-set predicate.
+ *
+ * `judicialClassName` is deliberately excluded: it is display text that
+ * travels alongside `judicialClassId` purely because the search form
+ * requires both (see `Query`'s own doc comment) - the id alone already
+ * identifies the class uniquely, so including the name too would risk two
+ * keys for what is really the same window if the name's exact string ever
+ * changed (a catalog re-fetch, a site copy edit) between runs.
+ */
 function windowKey(query: Query): string {
   return JSON.stringify({
     from: query.from,

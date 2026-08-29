@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { appendFile, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -67,6 +67,24 @@ describe('CaseStore', () => {
 
     const all = await store.all();
     expect(all.map((c) => c.number).sort()).toEqual(['case-a', 'case-b']);
+  });
+
+  it('caches the index after the first build: append updates it in memory without re-reading the file', async () => {
+    const store = new CaseStore(dir);
+    await store.append(makeCase({ number: 'case-a' }));
+    await store.index(); // builds and caches the index
+
+    // A write to the underlying file bypassing this store instance must not
+    // appear until a fresh instance re-reads from disk - proof the second
+    // append below is served from the in-memory index it maintains, not a
+    // disk re-scan.
+    await appendFile(join(dir, 'cases.ndjson'), `${JSON.stringify(makeCase({ number: 'ghost' }))}\n`);
+    await store.append(makeCase({ number: 'case-b' }));
+
+    const index = await store.index();
+    expect(index.has('ghost')).toBe(false);
+    expect(index.has('case-a')).toBe(true);
+    expect(index.has('case-b')).toBe(true);
   });
 
   it('rebuilds a 10k-line file reasonably fast', async () => {

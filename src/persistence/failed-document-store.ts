@@ -4,16 +4,13 @@
  *
  * Written to `data/failed-documents.ndjson`. The issue text names
  * `failed.json` (a single mutable JSON file); NDJSON is used instead for the
- * same reason every other store in this module is append-only: a single
- * JSON file has to be read whole, mutated, and rewritten whole on every
- * failure, which means a process killed mid-rewrite can corrupt the entire
- * file, not just lose the one record being added. Appending one line per
- * event sidesteps that failure mode entirely (see `ndjson-log.ts`'s module
- * comment) at the cost of needing a "latest record wins" read (below)
- * instead of the file already being the current state - a trade this module
- * makes gladly, since ISSUE-6 (the PDF downloader) is running in parallel
- * and this store's write path must never be able to corrupt a `success`
- * record it wrote moments earlier.
+ * same reason every other store in this module is append-only - see
+ * `ndjson-log.ts`'s module comment.
+ *
+ * A thin, document-shaped façade over the generic `FailureLedger`
+ * (`failure-ledger.ts`), keyed by `caseNumber::documentId` so a document
+ * failure and a case-detail failure (`case-failure-store.ts`) share the same
+ * failure/success/latest-wins machinery without duplicating it.
  *
  * ISSUE-6 owns `src/pje/download.ts` and never writes failure files itself
  * (its download function just returns a discriminated result); ISSUE-9 (the
@@ -24,17 +21,16 @@
 
 import { join } from 'node:path';
 
-import { appendLine, readLines } from './ndjson-log.js';
+import { FailureLedger, type FailureRecord } from './failure-ledger.js';
 
 export const FAILED_DOCUMENTS_FILE = 'failed-documents.ndjson';
 
-/** One failed-download attempt. */
-export interface FailedDocumentRecord {
-  type: 'failure';
+/** Everything ISSUE-6's download GET needs to retry, carried alongside the failure reason. */
+export interface DocumentFailureDetail {
   caseNumber: string;
   /** The document's `idProcessoDocumento`: stable and unique per document (see `types.ts`). */
   documentId: string;
-  /** `numeroDocumento`, kept alongside `documentId` since ISSUE-6's download GET needs both. */
+  /** `numeroDocumento` etc., kept alongside `documentId` since the download GET needs all five. */
   downloadRef: {
     idBin: string;
     numeroDocumento: string;
@@ -42,6 +38,13 @@ export interface FailedDocumentRecord {
     idProcessoDocumento: string;
     actionMethod: string;
   };
+}
+
+/** One failed document-download attempt, flattened back to the shape callers had before. */
+export interface FailedDocumentRecord {
+  caseNumber: string;
+  documentId: string;
+  downloadRef: DocumentFailureDetail['downloadRef'];
   reason: string;
   httpStatus?: number;
   attempt: number;
@@ -49,75 +52,59 @@ export interface FailedDocumentRecord {
   recordedAt: string;
 }
 
-/** A later record marking a previously-failed document as since downloaded successfully. */
-export interface SuccessDocumentRecord {
-  type: 'success';
-  caseNumber: string;
-  documentId: string;
-  recordedAt: string;
+function key(caseNumber: string, documentId: string): string {
+  return `${caseNumber}::${documentId}`;
 }
 
-type DocumentRecord = FailedDocumentRecord | SuccessDocumentRecord;
+/** Flattens a ledger record's `detail` back up alongside the failure fields. */
+function toFailedDocumentRecord(record: FailureRecord<DocumentFailureDetail>): FailedDocumentRecord {
+  return {
+    caseNumber: record.detail.caseNumber,
+    documentId: record.detail.documentId,
+    downloadRef: record.detail.downloadRef,
+    reason: record.reason,
+    ...(record.httpStatus !== undefined ? { httpStatus: record.httpStatus } : {}),
+    attempt: record.attempt,
+    retryable: record.retryable,
+    recordedAt: record.recordedAt,
+  };
+}
 
 export class FailedDocumentStore {
-  private readonly path: string;
+  private readonly ledger: FailureLedger<DocumentFailureDetail>;
 
   constructor(dataDir: string) {
-    this.path = join(dataDir, FAILED_DOCUMENTS_FILE);
+    this.ledger = new FailureLedger(join(dataDir, FAILED_DOCUMENTS_FILE));
   }
 
-  /**
-   * Records one failed attempt. `attempt` is the caller's own count (this
-   * store does not track it itself, so the orchestrator stays the single
-   * source of truth for how many times a document has been tried).
-   */
-  async recordFailure(record: Omit<FailedDocumentRecord, 'type' | 'recordedAt'>): Promise<void> {
-    const full: FailedDocumentRecord = {
-      ...record,
-      type: 'failure',
-      recordedAt: new Date().toISOString(),
-    };
-    await appendLine(this.path, full);
+  /** Records one failed download attempt for later retry. */
+  async recordFailure(input: {
+    caseNumber: string;
+    documentId: string;
+    downloadRef: DocumentFailureDetail['downloadRef'];
+    reason: string;
+    httpStatus?: number;
+    attempt: number;
+    retryable: boolean;
+  }): Promise<void> {
+    await this.ledger.recordFailure({
+      key: key(input.caseNumber, input.documentId),
+      reason: input.reason,
+      ...(input.httpStatus !== undefined ? { httpStatus: input.httpStatus } : {}),
+      attempt: input.attempt,
+      retryable: input.retryable,
+      detail: { caseNumber: input.caseNumber, documentId: input.documentId, downloadRef: input.downloadRef },
+    });
   }
 
   /** Records that a previously-failed document has since been downloaded successfully. */
   async recordSuccess(caseNumber: string, documentId: string): Promise<void> {
-    const record: SuccessDocumentRecord = {
-      type: 'success',
-      caseNumber,
-      documentId,
-      recordedAt: new Date().toISOString(),
-    };
-    await appendLine(this.path, record);
+    await this.ledger.recordSuccess(key(caseNumber, documentId));
   }
 
-  /**
-   * The documents currently worth retrying: for each (case, document) pair,
-   * only its **latest** record matters - a `failure` after an earlier
-   * `success` means it broke again and should retry; a `success` after a
-   * `failure` clears it. A document with only `failure` records but marked
-   * `retryable: false` on its latest one (e.g. a 404 that will never
-   * resolve itself) is excluded: retrying it would just spend requests
-   * confirming the same permanent outcome.
-   */
+  /** Documents currently worth retrying (latest record per document, only if still `retryable`). */
   async listRetryable(): Promise<FailedDocumentRecord[]> {
-    const records = await readLines(this.path, (line) => JSON.parse(line) as DocumentRecord);
-
-    const latestByKey = new Map<string, DocumentRecord>();
-    for (const record of records) {
-      latestByKey.set(key(record), record);
-    }
-
-    const retryable: FailedDocumentRecord[] = [];
-    for (const record of latestByKey.values()) {
-      if (record.type === 'failure' && record.retryable) {
-        retryable.push(record);
-      }
-    }
-    return retryable;
+    const records = await this.ledger.listRetryable();
+    return records.map(toFailedDocumentRecord);
   }
-}
-
-function key(record: DocumentRecord): string {
-  return `${record.caseNumber}::${record.documentId}`;
 }

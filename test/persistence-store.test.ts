@@ -38,27 +38,43 @@ describe('PersistenceStore (façade)', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('wires the full listed -> detailed -> stored flow', async () => {
+  it('wires the listed -> detailed -> stored flow, idempotently on a repeated run', async () => {
     const store = new PersistenceStore({ dataDir: dir });
-
     const event: SweepEvent = { type: 'window', query: dayQuery, rows: [row('case-a')], depth: 0 };
     expect(isFinalSweepEvent(event)).toBe(true);
-    await store.recordSweepEvent(event);
 
-    for (const r of event.rows) {
-      if (!(await store.hasCase(r.number))) await store.enqueueRow(r);
-    }
+    await store.recordFinalEvent(event);
     expect(await store.listPendingRows()).toEqual([row('case-a')]);
 
-    // Simulate fetching detail and storing it.
-    await store.appendCase(makeCase('case-a'));
-    await store.dequeueRow('case-a');
-
+    await store.completeRow(makeCase('case-a'));
     expect(await store.listPendingRows()).toEqual([]);
     expect(await store.hasCase('case-a')).toBe(true);
+
+    // Simulate a crash right after this work landed but before the run
+    // recorded having done it, so the same event and case repeat: neither
+    // duplicates at read time.
+    await store.recordFinalEvent(event);
+    await store.completeRow(makeCase('case-a'));
+
+    expect((await store.indexCases()).size).toBe(1);
+    expect((await store.rebuildSeenSet()).has('case-a')).toBe(true);
   });
 
-  it('supports the failed-document retry cycle end to end', async () => {
+  // B3: a kill between "window recorded covered" and "rows enqueued" must
+  // not lose the rows - recordFinalEvent enqueues first, so even a state
+  // that only got half-applied still has every row reachable.
+  it('recordFinalEvent enqueues every row before recording the event itself', async () => {
+    const store = new PersistenceStore({ dataDir: dir });
+    await store.recordFinalEvent({ type: 'window', query: dayQuery, rows: [row('a'), row('b')], depth: 0 });
+
+    // Both rows are reachable via the pending queue regardless of when a
+    // kill could have landed - there is no window where the event is
+    // recorded (seen-set covers the case) but the row is not enqueued.
+    expect((await store.listPendingRows()).map((r) => r.number).sort()).toEqual(['a', 'b']);
+    expect((await store.rebuildSeenSet()).has('a')).toBe(true);
+  });
+
+  it('supports the failed-document and failed-case retry cycles end to end', async () => {
     const store = new PersistenceStore({ dataDir: dir });
 
     await store.recordDocumentFailure({
@@ -76,20 +92,29 @@ describe('PersistenceStore (façade)', () => {
       attempt: 1,
       retryable: true,
     });
-
     expect(await store.listRetryableDocuments()).toHaveLength(1);
-
     await store.recordDocumentSuccess('case-a', 'doc-1');
     expect(await store.listRetryableDocuments()).toEqual([]);
+
+    // B4: a case whose detail fetch itself failed (not a document download)
+    // needs its own retryable record - this was the gap with no ledger at
+    // all before the case-failure store existed.
+    await store.recordCaseFailure({
+      caseNumber: 'case-b',
+      ca: 'ca-case-b',
+      reason: 'UnexpectedDetailPageError',
+      attempt: 1,
+      retryable: true,
+    });
+    expect(await store.listRetryableCases()).toHaveLength(1);
+    await store.recordCaseSuccess('case-b');
+    expect(await store.listRetryableCases()).toEqual([]);
   });
 
   it('kill-and-restart: a fresh PersistenceStore over the same dir sees everything written before the kill', async () => {
     const before = new PersistenceStore({ dataDir: dir });
-    await before.recordSweepEvent({ type: 'window', query: dayQuery, rows: [row('a'), row('b')], depth: 0 });
-    await before.enqueueRow(row('a'));
-    await before.enqueueRow(row('b'));
-    await before.dequeueRow('a');
-    await before.appendCase(makeCase('a'));
+    await before.recordFinalEvent({ type: 'window', query: dayQuery, rows: [row('a'), row('b')], depth: 0 });
+    await before.completeRow(makeCase('a'));
     // 'b' never got its detail fetched before the simulated kill.
 
     const after = new PersistenceStore({ dataDir: dir });
@@ -103,23 +128,5 @@ describe('PersistenceStore (façade)', () => {
 
     const isCovered = await after.rebuildCoveredPredicate();
     expect(isCovered(dayQuery)).toBe(true);
-  });
-
-  it('re-recording the same sweep event and re-appending the same case duplicates nothing at read time', async () => {
-    const store = new PersistenceStore({ dataDir: dir });
-    const event: SweepEvent = { type: 'window', query: dayQuery, rows: [row('a')], depth: 0 };
-
-    // Simulate a crash right after the sweep event and case were persisted,
-    // but before the run recorded that it had - so the same work repeats.
-    await store.recordSweepEvent(event);
-    await store.appendCase(makeCase('a'));
-    await store.recordSweepEvent(event);
-    await store.appendCase(makeCase('a'));
-
-    const cases = await store.indexCases();
-    expect(cases.size).toBe(1);
-
-    const seen = await store.rebuildSeenSet();
-    expect(seen.has('a')).toBe(true);
   });
 });
