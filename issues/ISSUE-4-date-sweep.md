@@ -1,7 +1,7 @@
 ---
 id: ISSUE-4
 title: Date-window sweep
-status: todo
+status: done
 ---
 
 ## Goal
@@ -74,4 +74,108 @@ indices, so there is no offset to exploit.
 
 ## Resolution
 
-_(pending)_
+**`src/pipeline/partition.ts`** — the `PartitionStrategy` interface
+(`canSplit(q)`, `split(q)`), plus:
+
+- `DateRangeSplit` — halves `[from, to]` at the integer midpoint. Arithmetic
+  runs entirely over epoch-day integers derived by `Date.parse` on an explicit
+  `T00:00:00.000Z` suffix, never `new Date()` in the local timezone (which
+  would shift day boundaries depending on where the process runs). Not
+  splittable once `from === to`.
+- `JudicialClassSplit` — applicable only to a single day (`from === to`) with
+  no class set yet; emits one subquery per class in the catalog handed to its
+  constructor. Applying the date axis first and the class axis only at a
+  single day matches the issue's evidence: splitting a wide range by class
+  would multiply requests for no benefit, since narrowing dates alone resolves
+  most saturation.
+- `PartitionChain` — an ordered list of strategies; `applicable(query)` returns
+  the first whose `canSplit` is true. The chain carries no partitioning logic
+  of its own, which is what lets ISSUE-4b's `PartyTokenSweep` plug in as a
+  third element of the array with zero changes to this file — verified with a
+  test (`test/partition.test.ts`, "accepts a third link without any change to
+  its own code") that appends a stub strategy and confirms the chain picks it
+  up.
+
+**`src/pipeline/sweep.ts`** — the walk itself: `sweep({ from, to, search,
+chain })`, an **async generator** yielding `SweepEvent`s (`'window'` for a
+completed window, capped or not; `'unsplittable'` for a leaf that saturated
+with nothing left in the chain to split it). Depth-first, so a short or
+interrupted run finishes a contiguous block of windows rather than a scattering
+of half-finished ones; recursion is expressed as `yield*` delegation into
+`walk(subquery, depth + 1)`, which reads as the same tree it describes.
+Deduplicates by CNJ number across the whole run via a `Set` closed over the
+walk, so a case surfacing in both a capped day-level window and one of its
+class-split children is only emitted once.
+
+**Design choice: async generator over an event callback.** Three reasons,
+elaborated in the code comment: (1) the walk is naturally recursive, and
+`yield*` delegation matches that shape directly, where a callback would need
+its own explicit stack; (2) an async generator gives backpressure for free —
+it does not run ahead of the consumer, which matters because every yielded
+window has already spent a live HTTP request, so a callback emitter would need
+its own pause mechanism to get the same throttling-friendly property; (3)
+testing is a plain `for await` collecting events into an array, no fake event
+bus needed. The cost is that a consumer must actively drive the generator
+(`for await (const _ of sweep(...))`), but ISSUE-7's resumable runner wants to
+persist state after every event anyway, which a `for await` loop does
+naturally — so this is not really a cost for the intended caller.
+
+**`src/pipeline/history-start.ts`** — optional, kept separate from the sweep as
+required. Binary-searches the first year with any filings by probing
+`[Jan-1-of-year, today]` and checking whether it returns zero rows; `O(log
+years)` rather than a linear year-by-year scan. The sweep itself only takes an
+explicit `from`/`to` and does not depend on this module.
+
+### A trap found while writing the tests
+
+The naive midpoint `from + (to - from) / 2` on an **even**-length range
+(2 days) rounds down to `from` itself when done with integer epoch days,
+which would make `split` return `[from, from]` and `[from+1, to]` — the first
+"half" being the whole single day already, technically correct but easy to
+get backwards. Wrote an explicit test for the 2-day case
+(`test/partition.test.ts`, "splits a two-day range into two single days") to
+pin the exact boundary, plus month-boundary and leap-day cases (Feb 28 → Mar 1
+in a leap year is 3 days and gets the extra day on the first half; the same
+range in a non-leap year is 2 days) to make sure the UTC epoch-day arithmetic
+does not silently misplace the boundary around calendar irregularities.
+
+### Verification
+
+`npm test`: **78 tests green** (57 pre-existing + 16 in `test/partition.test.ts`
++ 5 in `test/sweep.test.ts`), no network. `npm run typecheck`: clean.
+
+### Live smoke test
+
+Ran one sweep from 2025-03-10 to 2025-03-14 against the real TRF5 server
+(`delayMs: 1600`), budget capped at 40 requests (2 requests per query: the
+`open` + `post` pair `PjeSearch.search` performs), using the real
+`JsfSession`/`PjeSearch`/`HttpClient` stack unchanged:
+
+| Metric | Value |
+|---|---|
+| Requests used | 40 / 40 (budget hit mid-run, by design) |
+| Windows covered | 19 |
+| Capped windows (further split) | 4 |
+| Uncapped leaf windows | 15 |
+| Unsplittable leaves reached | 0 |
+| Split-by breakdown | `date-range`: 3, `judicial-class`: 1 |
+| Deduplicated rows emitted | 81 |
+
+The cascade ran exactly as designed: the 5-day root range capped at 30 and
+split by date three times in a row (`2025-03-10..14` → `2025-03-10..12` →
+`2025-03-10..11`, each still capped), down to single days; `2025-03-10` came
+back uncapped at 9 rows, while `2025-03-11` alone still capped at 14 and was
+handed to `JudicialClassSplit`. From there the class fan-out (132 classes)
+consumed the rest of the request budget before finishing that one day — which
+is the expected shape given the budget: class-splitting a saturated day costs
+up to 132 requests to exhaust every class, so a 40-request smoke budget
+naturally stops partway through the first one. No leaf reached "day + class
+still caps" in this run (0 unsplittable events), consistent with ISSUE-3's
+finding that 2025-03-11 + class 202 alone drops to 19, uncapped — but the
+cascade's third rung (ISSUE-4b) exists precisely because that is not
+guaranteed for every day/class combination.
+
+This also confirms the acceptance criteria empirically: the 5-day range did
+split itself until windows stopped capping, the saturating day was split by
+class rather than recorded as lost, and every window (capped or not) produced
+an event, so nothing here was silently truncated.
