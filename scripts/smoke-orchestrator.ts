@@ -11,7 +11,9 @@
  *
  * Flags (all optional): --from=YYYY-MM-DD (default: yesterday, UTC),
  * --to=YYYY-MM-DD (default: same as --from), --max-requests=N (default: 40),
- * --max-cases=N (default: 3), --delay-ms=N (default: 1500).
+ * --max-cases=N (default: 3), --delay-ms=N (default: 1500), --retry-failed
+ * (calls `scraper.retryFailed()` instead of `run()` - re-attempts whatever
+ * an earlier bounded run left in the retry ledgers, same store/budget).
  *
  * Writes under `data/`/`pdfs/` (both gitignored) - delete manually afterwards.
  */
@@ -71,9 +73,10 @@ async function main() {
   const maxRequests = Number(flag('max-requests', args) ?? '40');
   const maxCases = Number(flag('max-cases', args) ?? '3');
   const delayMs = Number(flag('delay-ms', args) ?? '1500');
+  const retryFailed = args.includes('--retry-failed');
 
   console.log(`range: ${from}..${to}`);
-  console.log(`limits: maxRequests=${maxRequests}, maxCases=${maxCases}, delayMs=${delayMs}`);
+  console.log(`limits: maxRequests=${maxRequests}, maxCases=${maxCases}, delayMs=${delayMs}, retryFailed=${retryFailed}`);
 
   const requestCounter = new LiveRequestCounter();
   const http = new HttpClient({
@@ -116,9 +119,9 @@ async function main() {
   });
 
   try {
-    const summary = await scraper.run({ from, to });
+    const summary = retryFailed ? await scraper.retryFailed() : await scraper.run({ from, to });
     printSummary(summary);
-    if (summary.windows === 1 && summary.casesListed === 0) {
+    if (!retryFailed && summary.windows === 1 && summary.casesListed === 0) {
       console.log('hint: 0 cases listed for a single window - the default day (yesterday) may be a weekend or holiday; try --from/--to on a business day.');
     }
   } catch (error) {
