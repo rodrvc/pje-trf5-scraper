@@ -1,7 +1,7 @@
 ---
 id: ISSUE-10
 title: Test suite with fixtures
-status: todo
+status: done
 ---
 
 ## Goal
@@ -33,4 +33,23 @@ document the site.
 
 ## Resolution
 
-_(pending)_
+243 tests across 24 files, all offline: network only ever goes through `nock`
+intercepts, and `pjett.trf5.jus.br` appears only inside `test/fixtures/`, never
+as a live target. 429 handling is covered with and without `Retry-After`,
+retry exhaustion, and the circuit breaker tripping and resetting
+(`test/client.test.ts`, `test/download.test.ts`, `test/backoff.test.ts`).
+Parsers are tested as pure `(html) => T` functions, no network involved.
+
+Fixtures: `results-capped.html`, `results-uncapped.html`,
+`rejection-response.html`, `class-catalog.html`, `detail-with-pagination.html`,
+`detail-slider-page1.html`, `detail-slider-page2-ajax.html` and
+`detail-page2-ajax.html` are real captures from the live site.
+`detail-sealed.html` and `detail-server-error.html` are hand-derived: no
+sealed case turned up among 17 live cases sampled looking for one, while the
+server-error fixture reproduces a genuine captured exception page.
+
+The ISSUE-5 prune (74 → 46 detail tests) held: a final pass over the suite
+found nothing tautological left to remove, so it was left as is.
+
+`npm test`: 243/243 green, no internet connection required. `npm run
+typecheck`: clean.
