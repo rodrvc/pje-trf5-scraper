@@ -300,3 +300,18 @@ documents (75 rows over 5 pages, 20 over 2) have their **pager detection**
 multi-page *walk* is exercised only in tests against derived fixtures - the
 walking mechanism itself is the same one just confirmed live on the smaller
 case, not a separate, unverified path.
+
+### Test suite
+
+The suite that shipped with this issue (74 tests across `test/parse-detail.
+test.ts` and `test/detail.test.ts`, 179 total in the repo) was pruned for
+human review to 46 (152 total): duplicate branches of the same widget/error
+path, per-field micro-assertions already covered by a real-fixture test, and
+tautological checks were removed or merged; every remaining test still maps
+to a distinct real behaviour or bug from this file. Line coverage of
+`parse-detail.ts`/`detail.ts` is unchanged (98.37%); branch coverage moved
+from 87.79% to 86.60% (measured with `@vitest/coverage-v8`, not added as a
+dependency). Both full real-page fixtures (`detail-with-pagination.html`,
+`detail-slider-page1.html`) were kept - they are two different real cases,
+each paired with its own page-2 AJAX capture, so dropping either would break
+that pairing.

@@ -92,7 +92,7 @@ describe('PjeDetail.fetch', () => {
     await expect(detail.fetch('nonumber')).rejects.toThrow(ParseError);
   });
 
-  it('throws ParseError when the extracted number does not match the search row', async () => {
+  it('throws ParseError on a mismatched expected number, and passes when it matches', async () => {
     const html = `
       <html><body>Dados do Processo
         <div class="propertyView"><div class="name"><label>Número Processo</label></div>
@@ -100,6 +100,7 @@ describe('PjeDetail.fetch', () => {
       </body></html>`;
 
     nock(BASE_URL).get(`${DETAIL_PATH}?ca=mismatch`).reply(200, html);
+    nock(BASE_URL).get(`${DETAIL_PATH}?ca=match`).reply(200, html);
 
     const session = new JsfSession(fastClient());
     const detail = new PjeDetail(session);
@@ -107,19 +108,6 @@ describe('PjeDetail.fetch', () => {
     await expect(
       detail.fetch('mismatch', '9999999-99.2099.9.99.9999'),
     ).rejects.toThrow(ParseError);
-  });
-
-  it('does not throw when the extracted number matches the expected one', async () => {
-    const html = `
-      <html><body>Dados do Processo
-        <div class="propertyView"><div class="name"><label>Número Processo</label></div>
-          <div class="value col-sm-12">0000462-42.2023.8.17.3480</div></div>
-      </body></html>`;
-
-    nock(BASE_URL).get(`${DETAIL_PATH}?ca=match`).reply(200, html);
-
-    const session = new JsfSession(fastClient());
-    const detail = new PjeDetail(session);
 
     const result = await detail.fetch('match', '0000462-42.2023.8.17.3480');
     expect(result.number).toBe('0000462-42.2023.8.17.3480');
@@ -452,30 +440,6 @@ describe('PjeDetail.fetch', () => {
     expect(nock.isDone()).toBe(true);
   });
 
-  it('does not mistake a movement mentioning "segredo de justiça" for a sealed case', async () => {
-    // The scoping fix at the parser level (classifyDetailPage only trusting
-    // the notice panel, never free page text) exercised end to end.
-    const html = `
-      <html><body>Dados do Processo
-        <div class="propertyView"><div class="name"><label>Número Processo</label></div>
-          <div class="value col-sm-12">0000462-42.2023.8.17.3480</div></div>
-        <table id="j_id146:processoEvento"><tbody>
-          <tr><td><span>01/01/2025 - Pedido de segredo de justiça indeferido</span></td></tr>
-        </tbody></table>
-      </body></html>`;
-
-    nock(BASE_URL).get(`${DETAIL_PATH}?ca=notreallysealed`).reply(200, html);
-
-    const session = new JsfSession(fastClient());
-    const detail = new PjeDetail(session);
-    const result = await detail.fetch('notreallysealed');
-
-    expect(result.sealed).toBe(false);
-    expect(result.movements).toEqual([
-      { date: '2025-01-01', description: 'Pedido de segredo de justiça indeferido' },
-    ]);
-  });
-
   it('walks a real, live-captured slider pager across its two pages (movements)', async () => {
     // detail-slider-page1.html / detail-slider-page2-ajax.html are a real
     // capture: case 0000462-42.2023.8.17.3480, 27 movements over 2 slider
@@ -581,7 +545,7 @@ describe('PjeDetail.fetch', () => {
 });
 
 describe('buildPagingBody', () => {
-  it('replays form fields in order, overriding the page field in place when it exists', () => {
+  it('replays form fields in order, overriding the page field in place, adding the slider\'s distinct event field', () => {
     const pager: Pager = {
       kind: 'slider',
       baseId: 'j_id146:y',
@@ -607,7 +571,7 @@ describe('buildPagingBody', () => {
     ]);
   });
 
-  it('appends the page field when it is not among the form fields (a datascroller page value is never a real input)', () => {
+  it('appends the page field with ajaxSingle when it is not among the form fields (a datascroller page value is never a real input)', () => {
     const pager: Pager = {
       kind: 'datascroller',
       baseId: 'j_id146:x:base',
@@ -625,34 +589,5 @@ describe('buildPagingBody', () => {
       ['ajaxSingle', 'j_id146:x:base:page'],
       ['AJAX:EVENTS_COUNT', '1'],
     ]);
-  });
-
-  it('adds ajaxSingle for a datascroller, not the slider event field', () => {
-    const pager: Pager = {
-      kind: 'datascroller',
-      baseId: 'j_id146:x:base',
-      pageFieldId: 'j_id146:x:base:page',
-      pageCount: 3,
-    };
-
-    const body = buildPagingBody(pager, 2, []);
-
-    expect(body.get('ajaxSingle')).toBe('j_id146:x:base:page');
-    expect(body.get('j_id146:x:base:page')).toBe('2');
-  });
-
-  it('adds the distinct event field for a slider, not ajaxSingle', () => {
-    const pager: Pager = {
-      kind: 'slider',
-      baseId: 'j_id146:y',
-      pageFieldId: 'j_id146:y:z',
-      eventFieldId: 'j_id146:y:w',
-      pageCount: 5,
-    };
-
-    const body = buildPagingBody(pager, 3, []);
-
-    expect(body.get('j_id146:y:w')).toBe('j_id146:y:w');
-    expect(body.get('ajaxSingle')).toBeNull();
   });
 });
