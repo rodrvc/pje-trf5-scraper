@@ -117,22 +117,27 @@ async function main(): Promise<number> {
     return 0;
   } catch (error) {
     if (error instanceof RunAbortedError) {
+      // The orchestrator already logged `run aborted: <reason>` through the sink.
       printSummary(error.summary);
-      console.error(error.message);
       return 1;
     }
     throw error;
   }
 }
 
+// `process.exitCode` rather than `process.exit()`: an immediate exit can
+// truncate piped stdout (`npm run scrape | tee run.log`) before it drains.
 main()
-  .then((code) => process.exit(code))
+  .then((code) => {
+    process.exitCode = code;
+  })
   .catch((error: unknown) => {
     if (error instanceof CliArgsError) {
       console.error(`error: ${error.message}\n`);
       console.error(usage());
-      process.exit(2);
+      process.exitCode = 2;
+      return;
     }
     console.error(error);
-    process.exit(1);
+    process.exitCode = 1;
   });

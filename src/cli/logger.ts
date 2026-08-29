@@ -43,7 +43,7 @@ function formatSweep(event: SweepEvent): string {
   }
 }
 
-/** One line per non-sweep `OrchestratorLogEvent` kind. */
+/** One line per `OrchestratorLogEvent` kind; sweep events delegate to `formatSweep`. */
 export function format(event: OrchestratorLogEvent): string {
   switch (event.kind) {
     case 'sweep':
