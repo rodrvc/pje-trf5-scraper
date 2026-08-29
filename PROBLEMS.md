@@ -290,17 +290,7 @@ implementation only recognised the datascroller, which silently truncated
 movements and documents down to whatever fit on page 1 — a real data-loss bug,
 not a documented behaviour, caught in review.
 
-The datascroller's paging POST:
-
-    AJAXREQUEST=_viewRoot
-    <baseId>=<baseId>                 # scroller id without the trailing suffix
-    javax.faces.ViewState=<current>
-    <scrollerId>=2                    # target page number
-    ajaxSingle=<scrollerId>
-    AJAX:EVENTS_COUNT=1
-
-Verified: moving to page 2 of the passive parties changes the participant list,
-and the response's row ids confirm it (see below).
+### Both pagers really submit the whole outer form, not their own small one — solved
 
 The slider's registration looks like:
 
@@ -311,29 +301,73 @@ The slider's registration looks like:
 
 `j_id562` (the slider's own id) is a real, named `<input>` field whose value is
 the current page; `j_id563` is a separate, self-referential id the `onchange`
-event names, parallel to the datascroller's `ajaxSingle`. **Unresolved:** a
-POST built from exactly these pieces (`AJAXREQUEST=_viewRoot`, the base form
-id, `<sliderId>=<page>`, `<eventId>=<eventId>`, `AJAX:EVENTS_COUNT=1` — and
-variants adding `containerId`, the enclosing form's other hidden fields, or
-`ajaxSingle` on the event id instead) got a 200 every time but with
-`Ajax-Update-Ids content=""`: the server accepted the request and rendered
-nothing. Ten live requests were spent on this (five GET+POST pairs) without
-success; a genuine page-2 movements response was never captured. The
-implementation (`buildPagingBody()` in `src/pje/detail.ts`) is the best
-reconstruction available, exercised only against a hand-derived fixture in
-tests, not a live one. Whoever picks up ISSUE-9 should verify this against the
-live site before trusting it for a real run — see this issue's own note and
-ISSUE-5's Resolution.
+event names. A first attempt built the paging POST from exactly these pieces
+plus the datascroller's own analogous small set (`AJAXREQUEST=_viewRoot`, the
+form/base id, `<pageId>=<page>`, `ajaxSingle=<pageId>` or the slider's event
+field, `AJAX:EVENTS_COUNT=1`). Both got a 200 every time but with
+`Ajax-Update-Ids content=""`: accepted, nothing rendered. Ten live requests
+were spent on the slider case alone without success.
 
-Neither the "N resultados encontrados" total the page declares for each table,
-nor the requirement that a page actually moved (both enforced now, see below),
-were caught by an earlier version of this code — a data-loss bug like the
-slider one would have passed silently.
+**Root cause, found and reproduced live: PJe nests `<form>` elements, which
+HTML forbids.** Each pager's own controls sit inside a `<form>` (e.g.
+`j_id146:j_id561`) that is itself inside the page's main content form
+(`j_id146`). A real browser parsing this markup silently drops the *inner*
+`<form>` open/close tags — nested forms are invalid HTML and get corrected the
+same way a stray unclosed tag would — so every field that looks like it
+belongs to the small inner "form" actually belongs to the outer one. When
+`A4J.AJAX.Submit('j_id146:j_id561', ...)` fires, it does not serialise some
+six-field sub-form; it serialises the **entire** `j_id146` form, all ~75
+fields of it (13 tables' worth of scroller/slider/sort-header hidden state).
+Posting only the inner six is a well-formed, plausible-looking request the
+server nonetheless has nothing to act on — which is exactly the silent,
+misleading failure mode `Ajax-Update-Ids content=""` describes.
+
+**Working recipe, live-verified** (case `0000462-42.2023.8.17.3480`, 27
+movements over 2 slider pages: 15 + 12 = 27):
+
+- Collect every named, submittable `<input>` (skip `submit`/`button`/
+  `image`/`checkbox`/`radio`) from `<form id="j_id146"` to the end of the
+  document, in order; `javax.faces.ViewState` sent once, not once per
+  visually-nested form.
+- Override the slider's own value field (`j_id146:j_id561:j_id562`) with the
+  target page number, in place.
+- Prepend `AJAXREQUEST=_viewRoot`; append the slider's distinct event field
+  (`j_id146:j_id561:j_id563=j_id146:j_id561:j_id563`) and
+  `AJAX:EVENTS_COUNT=1`.
+- Result: 200, `Ajax-Update-Ids: j_id146:processoEventoPanel`, 12 rows,
+  `'sliderValue':'2'` in the response.
+
+The same recipe, re-verified live against the datascroller (case
+`0803385-67.2025.4.05.0000`, passive parties, page 2): identical, **except**
+the datascroller's own page-value id (`...j_id401:j_id402`) is not a real
+`<input>` anywhere on the page — only a wrapper `<div>` — so it must be
+**added**, not overridden in place, alongside `ajaxSingle` set to that same
+id. One submit shape now covers both widgets
+(`buildPagingBody()`/`parseOuterFormFields()` in `src/pje/detail.ts` /
+`src/domain/parse-detail.ts`): result `Ajax-Update-Ids` non-empty, 12 real
+rows, row indices starting at 10 as expected for a datascroller page 2.
+
+**A second finding from this same investigation: a slider re-indexes its rows
+from 0 on every page.** A datascroller keeps a table's rows numbered by their
+*absolute* position (page 2 of a 12-row passive-parties table starts at index
+10). A slider's page 2 response instead restarts at index 0
+(`processoEvento:0:` .. `processoEvento:11:` for a 12-row second page) - live
+capture confirms this. `assertPageAdvanced` (`src/pje/detail.ts`) therefore
+checks the two widgets differently: absolute row index for a datascroller,
+the response's own `'sliderValue':'N'` for a slider.
+
+Neither the "N resultados encontrados" total the page declares for each
+table, nor the requirement that a page actually moved (both enforced now, see
+below), were caught by an earlier version of this code — a data-loss bug like
+the original truncation would have passed silently.
 
 The pager ids (one per table: active parties, passive parties, movements,
-documents) are read from the detail markup, and the page count comes from
+documents) are read from the detail markup, and the page count is derived
+from the table's own declared total divided by its page size when both are
+known (RichFaces renders at most ~10 numbered datascroller links, so beyond
+roughly 10 pages the pager's own count under-counts), falling back to
 `maxValue` (slider) or the paginator's own numbered links (datascroller,
-`«« « 1 2 3 ... » »»`).
+`«« « 1 2 3 ... » »»`) otherwise.
 
 Note: the detail page's ViewState differs from the search one and must be refreshed
 with every response.
@@ -348,9 +382,9 @@ So `ca=` is a stable case identifier, not a conversation token like the PDF `cid
 (problem 7). **It can be persisted for resuming**: picking up a run does not require
 re-running the search to reach an already-listed case.
 
-**Status:** implemented in ISSUE-5 (`src/pje/detail.ts`,
-`src/domain/parse-detail.ts`); the slider paging POST is not confirmed live
-(see above) and should be treated as unverified until it is.
+**Status:** implemented and live-verified in ISSUE-5 (`src/pje/detail.ts`,
+`src/domain/parse-detail.ts`) — both the datascroller and the slider paging
+POST, using the unified outer-form submit body above.
 
 ### A single-page table's pager markup is not always the same shape
 
@@ -361,6 +395,18 @@ case sampled, rendered **no pager registration at all** — not even a hidden
 one. Both must be read as "one page, nothing to walk", but the second case has
 no pager id to name at all, unlike the first.
 
+### A nested sub-table can silently miscount a row-counting selector too
+
+While cross-checking the fixes above, a related bug turned up:
+`countTableRows()` used a loose `tbody tr` descendant selector, which also
+picked up the datascroller's own small paging-control `<table>` — nested
+inside a `<tbody>` with no id, itself inside the outer table — as an extra
+row of the outer table. A 10-row passive-parties page 1 counted as 11,
+shrinking the inferred page size and making every subsequent page's expected
+row index wrong. Fixed by scoping to the direct `> tbody > tr` child
+everywhere a table's own rows are read (`parseParties`, `parseMovements`,
+`parseDocuments`, `countTableRows`).
+
 ### Every table's declared total and every paging response are now cross-checked
 
 Two defensive checks added after the truncation bug above, both in
@@ -369,17 +415,26 @@ Two defensive checks added after the truncation bug above, both in
 - The page itself declares a total ("N resultados encontrados") for each
   table; after walking every page, the collected row count must equal it
   (`assertTotalMatches`), or `ParseError` is thrown. This is what would have
-  caught the original truncation directly (75 declared, 15 collected).
-- Every row's id embeds its absolute position in the whole table (page 2 of a
-  12-row passive-parties table starts at index 10, not 0). If a paging POST
-  is silently ignored by the server (stale ViewState, a wrong field id after a
-  redeploy) it can return page 1 again with a 200 and no error; the response's
-  first row index is checked against where the requested page should start
-  (`assertPageAdvanced` in `src/pje/detail.ts`), or `ParseError` is thrown.
-  Without this, a silently-ignored page would duplicate rows undetected.
+  caught the original truncation directly (75 declared, 15 collected). Row
+  counting for this check always uses the raw row count
+  (`countTableRows()`), not the parsed-output count: a parser that silently
+  skips one unparsable row (as all four do, by design) would otherwise turn
+  that one lenient skip into a false-positive `ParseError` against the
+  declared total.
+- A paging POST that is silently ignored by the server (stale ViewState, a
+  wrong field id after a redeploy) can return the previous page again with a
+  200 and no error of its own. `assertPageAdvanced` (`src/pje/detail.ts`)
+  catches this, checked differently per widget since they behave differently
+  under paging: a datascroller's absolute row index (page 2 of a 12-row
+  passive-parties table starts at index 10, not 0) against a datascroller
+  page, the response's own `sliderValue` against a slider page (see above -
+  a slider's rows are re-indexed from 0 on every page, so the absolute-index
+  check does not apply to it). Either way, `ParseError` is thrown rather than
+  silently duplicating rows.
 
 A hard ceiling (500 pages) also guards against a bogus pager read turning into
-a request storm.
+a request storm, with its own dedicated error rather than being reported as a
+dropped page by `assertTotalMatches`.
 
 ### `nomeArqProcDocBin` is percent-encoded in latin-1, not UTF-8
 

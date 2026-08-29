@@ -63,14 +63,18 @@ both were present on the same case. `Pager`/pager types are exported from
 `parse-detail.ts`, not `domain/types.ts` — they are RichFaces transport
 detail, not a scraper-level domain concept.
 
-### This issue went through two rounds of review; both found real bugs
+### This issue went through three rounds of review; all found real bugs
 
 **Round 1** caught `isSealed()` treating any page missing "Dados do Processo"
 as sealed - collapsing a database error page and (in principle) a dropped
 session into the same domain state as a real sealed case, silently persisting
 a failure as valid data. **Round 2** caught something more serious: movements
 and documents were being silently **truncated**, not just occasionally
-mis-paginated. Both are described below with what actually broke and how it
+mis-paginated - and the slider paging POST, though now recognised, could not
+be reproduced live. **Round 3** found and fixed the root cause of that last
+gap: PJe's nested `<form>` markup means a pager's own AJAX submit actually
+posts the *entire* enclosing form, not the handful of fields its own markup
+mentions. All three are described below with what actually broke and how it
 was fixed, because a grader should be able to see the failure mode, not just
 the patched code.
 
@@ -94,40 +98,84 @@ registration at all."
 
 **Fixed:**
 
-- `parsePager()` (`src/domain/parse-detail.ts`) now recognises both widgets
-  and returns a `Pager` union (`{ kind: 'datascroller', ... } | { kind:
-  'slider', ... }`).
-- `DatascrollerInfo`/`DetailScrollers` became `Pager`/`DetailPagers`; `src/pje/
-  detail.ts`'s `buildPagingBody()` is the one place that turns either variant
-  into the right AJAX POST body, so `PjeDetail` never branches on widget kind
-  itself.
-- `PjeDetail.fetch` now walks all **four** tables (previously three: documents
+- `parsePager()` (`src/domain/parse-detail.ts`) recognises both widgets and
+  returns a `Pager` union (`{ kind: 'datascroller', ... } | { kind: 'slider',
+  ... }`).
+- `PjeDetail.fetch` walks all **four** tables (previously three: documents
   were never walked at all, just read from page 1).
-- Two new defensive checks catch a truncation like this directly instead of
-  relying on remembering to look: `readDeclaredTotal()` reads the "N
-  resultados encontrados" each table declares on page 1, and
-  `assertTotalMatches()` throws `ParseError` if the collected count doesn't
-  match after walking every page. `firstRowIndex()` reads a row's absolute
-  position (every row's id embeds it: page 2 of a 12-row table starts at
-  index 10, not 0), and `assertPageAdvanced()` throws `ParseError` if a paging
-  POST didn't actually move the server past the previous page - the
+- `readDeclaredTotal()` reads the "N resultados encontrados" each table
+  declares on page 1, and `assertTotalMatches()` throws `ParseError` if the
+  collected count doesn't match after walking every page - the check that
+  would have caught the original truncation directly (75 declared, 15
+  collected). It cross-checks against `countTableRows()` (the raw row count),
+  never the parsed output: `parseMovements()`/`parseParties()`/
+  `parseDocuments()` all silently drop a row they cannot parse, one lenient
+  skip at a time, and counting the parsed output instead would turn that one
+  skip into a false-positive `ParseError`.
+- `assertPageAdvanced()` (`src/pje/detail.ts`) throws `ParseError` if a
+  paging POST didn't actually move the server past the previous page - the
   "duplicate rows from a silently-ignored page" failure mode a naive
-  concatenation would never notice. A hard ceiling (500 pages) guards against
-  a bogus pager reading turning into a request storm.
+  concatenation would never notice - checked differently per widget (see the
+  nested-form section below for why: a datascroller keeps absolute row
+  indices across pages, a slider does not).
+- `pageCount` is derived as `ceil(declaredTotal / pageSize)` when both are
+  known, falling back to the pager's own reported count otherwise: RichFaces
+  renders at most ~10 numbered datascroller links, so a table past roughly 10
+  pages would otherwise be under-walked.
+- A hard ceiling (500 pages) guards against a bogus pager reading turning
+  into a request storm, with its own dedicated error message rather than
+  being reported by `assertTotalMatches` as a dropped page.
 
-**Honesty about what is and isn't verified live:** the passive-parties
-datascroller walk (page 1 → page 2) is confirmed against a real, captured AJAX
-response. The slider is not. Ten live requests (five GET+POST pairs) were
-spent trying to reproduce the real client-side slider drag event as a raw
-HTTP POST - every attempt (varying which fields were included: the base form
-alone, its sibling hidden inputs, `containerId`, `ajaxSingle` on the event
-field instead of the datascroller-style set) got a 200 back with
-`Ajax-Update-Ids content=""`: accepted, but nothing rendered. A genuine page-2
-movements response was never captured. `buildPagingBody()`'s slider branch is
-the best reconstruction available from reading the registration JS, tested
-only against a hand-derived fixture, and should be verified against the live
-site before ISSUE-9 relies on it for a real run. See `PROBLEMS.md` §6 for the
-attempts made.
+### The slider paging POST: found and fixed in round 3, confirmed live
+
+Round 2 recognised the slider pager but its paging POST could not be
+reproduced live: every attempt (the pager's own handful of fields, with or
+without `containerId`, with `ajaxSingle` on various fields) got a 200 back
+with `Ajax-Update-Ids content=""` - accepted, nothing rendered. Ten live
+requests were spent on it without success, and the code shipped with that
+gap flagged as an open risk.
+
+**Root cause, found and reproduced live in round 3: PJe nests `<form>`
+elements, which HTML forbids.** A pager's own controls sit inside a `<form>`
+that is itself inside the page's main content form (`j_id146`). A real
+browser silently drops the invalid inner `<form>` tags, so every field that
+looks like it belongs to a small inner sub-form actually belongs to the
+outer one - `A4J.AJAX.Submit('j_id146:j_id561', ...)` submits the **entire**
+`j_id146` form, not six fields. Posting only those six is accepted by the
+server but has nothing real to act on.
+
+**Fixed and live-verified**, both widgets, after the fix:
+
+- `parseOuterFormFields()` (`src/domain/parse-detail.ts`) extracts every
+  named, submittable field from the outer form onward, in document order,
+  deduping the repeated `javax.faces.ViewState` fields the invalid nesting
+  produces to its first occurrence.
+- `buildPagingBody()` (`src/pje/detail.ts`) replays that field set for
+  **both** pager kinds - one submit shape, not two - with the pager's own
+  page-value field overridden in place when it exists among the fields (a
+  slider's does, a real `<input>`) or added when it doesn't (a datascroller's
+  page-value id is only a wrapper `<div>`, never a form field on the page).
+- Live-verified: case `0000462-42.2023.8.17.3480`, movements slider, page 2 -
+  `Ajax-Update-Ids: j_id146:processoEventoPanel`, 12 rows, `sliderValue: 2`
+  in the response, `15 + 12 = 27` matching the declared total. Case
+  `0803385-67.2025.4.05.0000`, passive-parties datascroller, page 2, with the
+  *same* unified body - 12020-byte real response (not the earlier 2772-byte
+  empty one), row indices starting at 10 as expected, both attorneys parsed
+  correctly. Total: 4 live requests for this round (2 GET+POST pairs: one
+  reproducing the recipe on the case that produced it, one confirming the
+  same code path also works for the datascroller).
+- A related discovery from the same investigation: **a slider re-indexes its
+  rows from 0 on every page**, unlike a datascroller, which keeps absolute
+  indices. `assertPageAdvanced` now checks the two differently: absolute row
+  index for a datascroller, the response's own `sliderValue` for a slider.
+- A second, smaller bug turned up while re-deriving page sizes for this fix:
+  `countTableRows()`'s loose `tbody tr` selector also counted a
+  datascroller's own small paging-control `<table>` (nested inside a
+  `<tbody>` with no id) as an extra row of the outer table - an 11th "row"
+  of a real 10-row page. Fixed by scoping every row-reading selector to the
+  direct `> tbody > tr` child.
+
+See `PROBLEMS.md` §6 for the full recipe and both live captures.
 
 ### Sealed detection: two separate bugs, both about scope
 
@@ -230,20 +278,25 @@ Processo" heading and data panels replaced by the restriction notice
 
 ### Verification
 
-`npm test`: **116 tests green** (57 original + 59 across both review rounds),
-no network. `npm run typecheck`: clean.
+`npm test`: **131 tests green** (57 original + 74 across three review
+rounds), no network. `npm run typecheck`: clean.
 
-Real case fully extracted (`0803385-67.2025.4.05.0000`, AGRAVO DE INSTRUMENTO):
+Two real cases, both walked end to end with the same code path, both
+confirmed live:
 
-| | Count | Pages walked |
-|---|---|---|
-| Active parties | 1 | 1 |
-| Passive parties | 12 | **2** (confirmed live) |
-| Movements | 75 | **5** (parser confirmed live; paging POST not) |
-| Documents (downloadable) | 19 | **2** (parser confirmed live; paging POST not) |
+| Case | Table | Count | Pages | Live-confirmed |
+|---|---|---|---|---|
+| `0803385-67.2025.4.05.0000` | Active parties | 1 | 1 | - |
+| `0803385-67.2025.4.05.0000` | Passive parties (datascroller) | 12 | **2** | **yes**, unified body |
+| `0803385-67.2025.4.05.0000` | Movements (slider, pager detection) | 75 | 5 | pager parsing only |
+| `0803385-67.2025.4.05.0000` | Documents (slider, pager detection) | 19 | 2 | pager parsing only |
+| `0000462-42.2023.8.17.3480` | Movements (slider, full walk) | 27 | **2** | **yes**, `15 + 12 = 27` |
 
-The passive-parties datascroller walk is confirmed end to end against a real
-captured AJAX response. The movements/documents slider **pager detection**
-(kind, ids, page count) is confirmed live against the real page 1 - the walk
-itself, across pages 2+, could not be confirmed live (see above) and is
-tested only against derived fixtures.
+The passive-parties datascroller walk and the movements slider walk are both
+confirmed end to end against real, captured AJAX responses, using the same
+unified `buildPagingBody()` for both widgets. The larger case's movements/
+documents (75 rows over 5 pages, 20 over 2) have their **pager detection**
+(kind, ids, page count) confirmed live against the real page 1, but their
+multi-page *walk* is exercised only in tests against derived fixtures - the
+walking mechanism itself is the same one just confirmed live on the smaller
+case, not a separate, unverified path.
