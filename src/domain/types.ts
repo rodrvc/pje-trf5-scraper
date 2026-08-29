@@ -28,8 +28,8 @@ export interface Movement {
 /**
  * A document attached to the case.
  *
- * All four identifiers are required by the download link and none can be derived
- * from the others, so they are all kept.
+ * All the identifiers are required to build the download link (ISSUE-6) and
+ * none can be derived from the others, so they are all kept.
  */
 export interface CaseDocument {
   /** ISO 8601 date. */
@@ -40,7 +40,19 @@ export interface CaseDocument {
   kind: string;
   idBin: string;
   numeroDocumento: string;
+  /**
+   * File name the download link declares (e.g. "Inteiro Teor"). Kept for
+   * ISSUE-6, which uses it to build a descriptive local file name; the
+   * `documentId` still guarantees uniqueness since this name is not.
+   */
+  nomeArqProcDocBin: string;
   idProcessoDocumento: string;
+  /**
+   * The JSF `actionMethod` the download link carries (URL-encoded EL
+   * expression naming the backing bean action). ISSUE-6 needs it verbatim to
+   * reproduce the GET.
+   */
+  actionMethod: string;
   /** Local path of the PDF once downloaded. */
   localPath?: string;
 }
@@ -145,4 +157,30 @@ export interface CapSignal {
 export interface JudicialClass {
   id: string;
   name: string;
+}
+
+/**
+ * A `Richfaces.Datascroller` found in the detail markup: active parties,
+ * passive parties and movements each have their own.
+ *
+ * `baseId` is the scroller's parent component (what the paging POST targets
+ * with `AJAXREQUEST`), while `scrollerId` is the specific field that carries
+ * the target page number. Both come straight out of the
+ * `new Richfaces.Datascroller(...)` call in the markup, alongside the page
+ * count read from the paginator's own numbered links.
+ */
+export interface DatascrollerInfo {
+  /** Component the AJAX POST is addressed to (scroller id minus its suffix). */
+  baseId: string;
+  /** Full id of the scroller field, also used as `ajaxSingle`. */
+  scrollerId: string;
+  /** Total pages, from the paginator's rendered links. 1 when there is no paging. */
+  pageCount: number;
+}
+
+/** The three tables the detail view paginates independently. */
+export interface DetailScrollers {
+  activeParties?: DatascrollerInfo;
+  passiveParties?: DatascrollerInfo;
+  movements?: DatascrollerInfo;
 }
