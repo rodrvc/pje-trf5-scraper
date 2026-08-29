@@ -405,9 +405,10 @@ describe('PjeDetail.fetch', () => {
 
     const session = new JsfSession(fastClient());
     const detail = new PjeDetail(session);
-    const result = await detail.fetch('sealed1');
+    const result = await detail.fetch('sealed1', '0000001-00.2025.4.05.0000');
 
     expect(result.sealed).toBe(true);
+    expect(result.number).toBe('0000001-00.2025.4.05.0000');
     expect(result.activeParties).toEqual([]);
     expect(result.passiveParties).toEqual([]);
     expect(result.movements).toEqual([]);
