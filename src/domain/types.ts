@@ -26,24 +26,19 @@ export interface Movement {
 }
 
 /**
- * A document attached to the case.
+ * The identifiers a document's download link carries.
  *
- * All the identifiers are required to build the download link (ISSUE-6) and
- * none can be derived from the others, so they are all kept.
+ * All five are required to build the GET (ISSUE-6) and none can be derived
+ * from the others, so they travel together as one object rather than five
+ * loose fields on `CaseDocument`.
  */
-export interface CaseDocument {
-  /** ISO 8601 date. */
-  date: string;
-  /** Display name: "Despacho", "Acórdão"... */
-  name: string;
-  /** Type as declared by the system. */
-  kind: string;
+export interface DocumentDownloadRef {
   idBin: string;
   numeroDocumento: string;
   /**
-   * File name the download link declares (e.g. "Inteiro Teor"). Kept for
-   * ISSUE-6, which uses it to build a descriptive local file name; the
-   * `documentId` still guarantees uniqueness since this name is not.
+   * File name the download link declares (e.g. "Inteiro Teor"). Used to build
+   * a descriptive local file name; `idProcessoDocumento` is what guarantees
+   * uniqueness, since this name is not guaranteed to be.
    */
   nomeArqProcDocBin: string;
   idProcessoDocumento: string;
@@ -53,6 +48,18 @@ export interface CaseDocument {
    * reproduce the GET.
    */
   actionMethod: string;
+}
+
+/** A document attached to the case. */
+export interface CaseDocument {
+  /** ISO 8601 date. */
+  date: string;
+  /** Display name: "Despacho", "Acórdão"... */
+  name: string;
+  /** Type as declared by the system. */
+  kind: string;
+  /** Everything ISSUE-6 needs to build the download GET, as one object. */
+  download: DocumentDownloadRef;
   /** Local path of the PDF once downloaded. */
   localPath?: string;
 }
@@ -69,10 +76,19 @@ export interface LegalCase {
 
   judicialClass?: string;
   subject?: string;
-  /** Filing date (autuação) in ISO 8601. */
+  /**
+   * ISO 8601 date. Read from the header's "Data da Distribuição" (distribution
+   * date) field - the brief and PROBLEMS.md call this "autuação" (filing), but
+   * that is not the label the detail page itself uses. Kept as `filingDate`
+   * since that is the concept the rest of the scraper (the date-window sweep)
+   * queries by, but the actual source field is distribuição, not autuação.
+   */
   filingDate?: string;
   jurisdiction?: string;
+  /** Órgão Julgador Colegiado (the collegiate body), when the case has one. */
   court?: string;
+  /** Órgão Julgador (the judging body/chamber), when distinct from `court`. */
+  judgingBody?: string;
   address?: string;
   referenceCase?: string;
 
@@ -159,28 +175,3 @@ export interface JudicialClass {
   name: string;
 }
 
-/**
- * A `Richfaces.Datascroller` found in the detail markup: active parties,
- * passive parties and movements each have their own.
- *
- * `baseId` is the scroller's parent component (what the paging POST targets
- * with `AJAXREQUEST`), while `scrollerId` is the specific field that carries
- * the target page number. Both come straight out of the
- * `new Richfaces.Datascroller(...)` call in the markup, alongside the page
- * count read from the paginator's own numbered links.
- */
-export interface DatascrollerInfo {
-  /** Component the AJAX POST is addressed to (scroller id minus its suffix). */
-  baseId: string;
-  /** Full id of the scroller field, also used as `ajaxSingle`. */
-  scrollerId: string;
-  /** Total pages, from the paginator's rendered links. 1 when there is no paging. */
-  pageCount: number;
-}
-
-/** The three tables the detail view paginates independently. */
-export interface DetailScrollers {
-  activeParties?: DatascrollerInfo;
-  passiveParties?: DatascrollerInfo;
-  movements?: DatascrollerInfo;
-}
