@@ -14,7 +14,8 @@
     "start": "tsx src/cli/index.ts",
     "scrape": "tsx src/cli/index.ts",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "smoke:download": "tsx scripts/smoke-download.ts"
   },
   "dependencies": {
     "axios": "^1.7.9",
