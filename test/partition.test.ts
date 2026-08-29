@@ -1,0 +1,145 @@
+import { describe, expect, it } from 'vitest';
+
+import { DateRangeSplit, JudicialClassSplit, PartitionChain } from '../src/pipeline/partition.js';
+import type { JudicialClass, Query } from '../src/domain/types.js';
+
+describe('DateRangeSplit', () => {
+  const strategy = new DateRangeSplit();
+
+  it('is not splittable when the range is a single day', () => {
+    expect(strategy.canSplit({ from: '2025-03-11', to: '2025-03-11' })).toBe(false);
+  });
+
+  it('splits a two-day range into two single days', () => {
+    const query: Query = { from: '2025-03-11', to: '2025-03-12' };
+    expect(strategy.canSplit(query)).toBe(true);
+    expect(strategy.split(query)).toEqual([
+      { from: '2025-03-11', to: '2025-03-11' },
+      { from: '2025-03-12', to: '2025-03-12' },
+    ]);
+  });
+
+  it('halves an odd-length range giving the extra day to the first half', () => {
+    // 2025-03-01..2025-03-05 is 5 days: mid should split 3/2, never an empty half.
+    const query: Query = { from: '2025-03-01', to: '2025-03-05' };
+    const [first, second] = strategy.split(query);
+    expect(first).toEqual({ from: '2025-03-01', to: '2025-03-03' });
+    expect(second).toEqual({ from: '2025-03-04', to: '2025-03-05' });
+  });
+
+  it('crosses a month boundary correctly', () => {
+    const query: Query = { from: '2025-02-27', to: '2025-03-02' };
+    const [first, second] = strategy.split(query);
+    // 4 days total (27, 28, 01, 02): first half gets the extra day.
+    expect(first).toEqual({ from: '2025-02-27', to: '2025-02-28' });
+    expect(second).toEqual({ from: '2025-03-01', to: '2025-03-02' });
+  });
+
+  it('handles the leap day correctly (2024 is a leap year)', () => {
+    const query: Query = { from: '2024-02-28', to: '2024-03-01' };
+    const [first, second] = strategy.split(query);
+    // 3 days total (28, 29, 01): first half gets the extra day.
+    expect(first).toEqual({ from: '2024-02-28', to: '2024-02-29' });
+    expect(second).toEqual({ from: '2024-03-01', to: '2024-03-01' });
+  });
+
+  it('does not treat 2025 (non-leap) as having a Feb 29', () => {
+    // A range spanning what would be Feb 29 in a leap year, in a non-leap one:
+    // Feb 28 -> Mar 1 is a 2-day range, not 3.
+    const query: Query = { from: '2025-02-28', to: '2025-03-01' };
+    expect(strategy.split(query)).toEqual([
+      { from: '2025-02-28', to: '2025-02-28' },
+      { from: '2025-03-01', to: '2025-03-01' },
+    ]);
+  });
+
+  it('preserves other query fields across the split', () => {
+    const query: Query = {
+      from: '2025-03-11',
+      to: '2025-03-12',
+      judicialClassId: '202',
+      judicialClassName: 'Agravo de Instrumento',
+    };
+    for (const subquery of strategy.split(query)) {
+      expect(subquery.judicialClassId).toBe('202');
+      expect(subquery.judicialClassName).toBe('Agravo de Instrumento');
+    }
+  });
+
+  it('throws rather than silently no-op when asked to split an unsplittable range', () => {
+    expect(() => strategy.split({ from: '2025-03-11', to: '2025-03-11' })).toThrow(RangeError);
+  });
+});
+
+describe('JudicialClassSplit', () => {
+  const catalog: JudicialClass[] = [
+    { id: '202', name: 'Agravo de Instrumento' },
+    { id: '283', name: 'Apelação Cível' },
+  ];
+  const strategy = new JudicialClassSplit(catalog);
+
+  it('is applicable only to a single day with no class set yet', () => {
+    expect(strategy.canSplit({ from: '2025-03-11', to: '2025-03-11' })).toBe(true);
+  });
+
+  it('is not applicable to a multi-day range, even without a class', () => {
+    expect(strategy.canSplit({ from: '2025-03-11', to: '2025-03-12' })).toBe(false);
+  });
+
+  it('is not applicable once a class is already set', () => {
+    expect(
+      strategy.canSplit({ from: '2025-03-11', to: '2025-03-11', judicialClassId: '202' }),
+    ).toBe(false);
+  });
+
+  it('produces one subquery per class in the catalog', () => {
+    const query: Query = { from: '2025-03-11', to: '2025-03-11' };
+    expect(strategy.split(query)).toEqual([
+      { from: '2025-03-11', to: '2025-03-11', judicialClassId: '202', judicialClassName: 'Agravo de Instrumento' },
+      { from: '2025-03-11', to: '2025-03-11', judicialClassId: '283', judicialClassName: 'Apelação Cível' },
+    ]);
+  });
+
+  it('throws rather than silently no-op when called on a query it cannot split', () => {
+    expect(() =>
+      strategy.split({ from: '2025-03-11', to: '2025-03-11', judicialClassId: '202' }),
+    ).toThrow(RangeError);
+  });
+});
+
+describe('PartitionChain', () => {
+  it('picks the first strategy able to split the query', () => {
+    const catalog: JudicialClass[] = [{ id: '202', name: 'Agravo de Instrumento' }];
+    const chain = new PartitionChain([new DateRangeSplit(), new JudicialClassSplit(catalog)]);
+
+    expect(chain.applicable({ from: '2025-03-11', to: '2025-03-12' })?.name).toBe('date-range');
+    expect(chain.applicable({ from: '2025-03-11', to: '2025-03-11' })?.name).toBe('judicial-class');
+  });
+
+  it('returns undefined when no link in the chain can split further', () => {
+    const chain = new PartitionChain([new DateRangeSplit(), new JudicialClassSplit([])]);
+    // Single day, class already set, empty catalog: nothing left to try.
+    expect(
+      chain.applicable({ from: '2025-03-11', to: '2025-03-11', judicialClassId: '202' }),
+    ).toBeUndefined();
+  });
+
+  it('accepts a third link without any change to its own code', () => {
+    // Stand-in for ISSUE-4b's PartyTokenSweep: the chain only needs the
+    // PartitionStrategy shape, so a fake with that shape plugs in unchanged.
+    const partyTokenStub = {
+      name: 'party-token',
+      canSplit: (q: Query) => q.judicialClassId !== undefined,
+      split: (q: Query) => [q],
+    };
+    const chain = new PartitionChain([
+      new DateRangeSplit(),
+      new JudicialClassSplit([]),
+      partyTokenStub,
+    ]);
+
+    expect(
+      chain.applicable({ from: '2025-03-11', to: '2025-03-11', judicialClassId: '202' })?.name,
+    ).toBe('party-token');
+  });
+});
