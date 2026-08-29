@@ -96,13 +96,26 @@ async function main() {
     downloader,
     store,
     chain,
-    logger: { log: (event) => console.log(JSON.stringify(event)) },
+    // Sweep events can carry up to 30 rows each: print a one-line summary,
+    // not the full payload, so the terminal stays readable.
+    logger: {
+      log: (event) =>
+        console.log(
+          event.kind === 'sweep'
+            ? JSON.stringify({ kind: 'sweep', type: event.event.type, query: event.event.query, rows: event.event.rows.length })
+            : JSON.stringify(event),
+        ),
+    },
     requestCounter,
     limits: { maxRequests, maxCases },
   });
 
   try {
-    printSummary(await scraper.run({ from, to }));
+    const summary = await scraper.run({ from, to });
+    printSummary(summary);
+    if (summary.windows === 1 && summary.casesListed === 0) {
+      console.log('hint: 0 cases listed for a single window - the default day (yesterday) may be a weekend or holiday; try --from/--to on a business day.');
+    }
   } catch (error) {
     // A RunAbortedError (circuit breaker) still carries a usable summary.
     if (error !== null && typeof error === 'object' && 'summary' in error) {
