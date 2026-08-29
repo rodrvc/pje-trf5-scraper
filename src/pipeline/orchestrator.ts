@@ -6,18 +6,18 @@
  * flags and instantiates a `Scraper`; every decision about what to do with a
  * sweep event, a failed detail fetch or a failed download lives here.
  *
- * The loop and its failure policy are part 1; resume/retry (9b) is now here
- * too. Request budgets and rate limits (9c) remain a TODO on `ScraperOptions`.
+ * The loop and its failure policy are part 1; resume/retry (9b) is here too;
+ * request/case budgets and the class-split sanity check (9c) round it out.
  *
  * Rows are detailed as soon as their window is recorded (interleaved with the
  * sweep), not after the whole range has been walked: the sweep already walks
  * "from the present backwards" so a short or interrupted run still lands
  * complete, contiguous, *detailed* cases near one end of the range, not just
- * complete search windows with nothing behind them - and a future budget
- * (9c) would otherwise be spent entirely on searching before a single case
- * gets detailed. `drainPendingRows` still runs once at the end, for rows a
- * previous run left pending (resume, 9b) or that a `cover`'s dedup left
- * unprocessed mid-walk.
+ * complete search windows with nothing behind them - and a budget (9c) would
+ * otherwise be spent entirely on searching before a single case gets
+ * detailed. `drainPendingRows` still runs once at the end (unless the budget
+ * already stopped the run), for rows a previous run left pending (resume,
+ * 9b) or that a `cover`'s dedup left unprocessed mid-walk.
  *
  * ## Failure policy
  *
@@ -85,7 +85,9 @@ export type OrchestratorLogEvent =
   | { kind: 'case-failed'; number: string; reason: string }
   | { kind: 'document-downloaded'; caseNumber: string; documentId: string; skipped: boolean }
   | { kind: 'document-failed'; caseNumber: string; documentId: string; reason: string }
-  | { kind: 'run-aborted'; reason: string };
+  | { kind: 'run-aborted'; reason: string }
+  | { kind: 'classSplitCheck'; day: string; childrenRows: number; ok: boolean }
+  | { kind: 'classSplitCheck'; day: string; childrenRows: number; ok: undefined; incomplete: true };
 
 /** Log sink the orchestrator reports every event through. Never `console` directly. */
 export interface LogSink {
@@ -117,6 +119,13 @@ export interface RunSummary {
   pendingRows: number;
   retryableCases: number;
   retryableDocuments: number;
+  /**
+   * Set when `limits` (9c) stopped the run before it walked out naturally -
+   * `undefined` means the sweep and drain both ran to completion. A bounded
+   * stop is not an abort: it is a clean, successful run that simply chose
+   * not to do more work (see `RunLimits`).
+   */
+  stoppedBy: 'maxRequests' | 'maxCases' | undefined;
 }
 
 /**
@@ -145,6 +154,28 @@ export interface RequestCounter {
   readonly retries429: number;
 }
 
+/**
+ * A bounded demo run's request/case budget (9c). `maxRequests` needs
+ * `requestCounter` wired in - it is the only thing that knows how many
+ * network attempts have actually happened (`HttpClientOptions.onRequest`).
+ *
+ * `maxRequests` is gated at three granularities - before each search, before
+ * each row's detail fetch, and before each document download - so its
+ * overshoot is bounded to at most one request: the one already in flight
+ * when the check ran. The one exception is a `cover` leaf (ISSUE-4b): a
+ * single sweep step there can still cost up to ~15 of its own searches
+ * before yielding, so a stop can land after a whole cover pass rather than
+ * after just one request. `maxCases` counts only *successful* detail
+ * fetches (`RunSummary.casesDetailed`) - a case that fails its detail fetch
+ * does not count against it.
+ */
+export interface RunLimits {
+  /** Stop once `requestCounter.requests` reaches this many network attempts. */
+  maxRequests?: number;
+  /** Stop once this many cases have had their detail fetched (successfully). */
+  maxCases?: number;
+}
+
 export interface ScraperOptions {
   search: SearchFn;
   detail: DetailFetcher;
@@ -159,9 +190,9 @@ export interface ScraperOptions {
    * left off instead of re-registering (and re-listing) cases already found.
    */
   seen?: SeenSet;
-  // TODO(9c): accept a `maxRequests` budget and stop the walk once
-  // `requestCounter.requests` reaches it.
   requestCounter?: RequestCounter;
+  /** Optional request/case budget for a bounded demo run (9c). Omit for an unbounded run. */
+  limits?: RunLimits;
 }
 
 export class Scraper {
@@ -174,6 +205,9 @@ export class Scraper {
   private readonly logger: LogSink;
   private readonly seen: SeenSet | undefined;
   private readonly requestCounter: RequestCounter | undefined;
+  private readonly limits: RunLimits | undefined;
+  /** Set once a budget is hit; checked before starting any further new work. */
+  private stoppedBy: 'maxRequests' | 'maxCases' | undefined;
 
   constructor(options: ScraperOptions) {
     this.search = options.search;
@@ -185,25 +219,47 @@ export class Scraper {
     this.logger = options.logger;
     this.seen = options.seen;
     this.requestCounter = options.requestCounter;
+    this.limits = options.limits;
+  }
+
+  /** Whether `maxRequests` alone has been reached - the only limit checked per document. */
+  private maxRequestsExceeded(): boolean {
+    const { maxRequests } = this.limits ?? {};
+    return maxRequests !== undefined && (this.requestCounter?.requests ?? 0) >= maxRequests;
+  }
+
+  /** Which budget (9c) has been reached, if any - a clean stop, not an abort. */
+  private budgetExceeded(summary: RunSummary): 'maxRequests' | 'maxCases' | undefined {
+    if (this.maxRequestsExceeded()) return 'maxRequests';
+    const { maxCases } = this.limits ?? {};
+    if (maxCases !== undefined && summary.casesDetailed >= maxCases) {
+      return 'maxCases';
+    }
+    return undefined;
   }
 
   /** Runs the full sweep -> detail -> PDFs -> persistence flow for one date range. */
   async run(range: { from: string; to: string }): Promise<RunSummary> {
     const summary = emptySummary();
+    this.stoppedBy = undefined;
 
     try {
       await this.runSweep(range, summary);
-      await this.drainPendingRows(summary);
+      if (this.stoppedBy === undefined) {
+        await this.drainPendingRows(summary);
+      }
     } catch (error) {
       // Cross-cutting abort: a circuit breaker (or anything else the sweep,
       // detail fetch or download did not itself turn into a recorded
       // failure) stops the run. Whatever persistence writes already
       // happened for earlier rows stand - only the walk itself unwinds.
+      summary.stoppedBy = this.stoppedBy;
       await this.finalizeSummary(summary);
       this.logger.log({ kind: 'run-aborted', reason: describeError(error) });
       throw new RunAbortedError(error, summary);
     }
 
+    summary.stoppedBy = this.stoppedBy;
     await this.finalizeSummary(summary);
     return summary;
   }
@@ -230,8 +286,7 @@ export class Scraper {
   private async runSweep(range: { from: string; to: string }, summary: RunSummary): Promise<void> {
     const seen = this.seen ?? (await this.store.rebuildSeenSet());
     const skipWindow = await this.store.rebuildCoveredPredicate();
-
-    for await (const event of sweep({
+    const generator = sweep({
       from: range.from,
       to: range.to,
       search: this.search,
@@ -239,20 +294,49 @@ export class Scraper {
       ...(this.cover !== undefined ? { cover: this.cover } : {}),
       seen,
       skipWindow,
-    })) {
-      this.logger.log({ kind: 'sweep', event });
-      if (isFinalSweepEvent(event)) {
-        summary.windows += 1;
-        summary.casesListed += event.rows.length;
-        await this.store.recordFinalEvent(event);
-        for (const row of event.rows) {
-          await this.processRow(row, summary);
+    });
+    const classSplitCheck = new ClassSplitCheck(this.logger);
+
+    try {
+      for (;;) {
+        // Before every next search: a hit here means no further search runs.
+        // `generator.return()` closes the sweep's async generator cleanly.
+        const exceeded = this.budgetExceeded(summary);
+        if (exceeded !== undefined) {
+          this.stoppedBy = exceeded;
+          await generator.return(undefined);
+          return;
         }
-        continue;
+
+        const step = await generator.next();
+        if (step.done === true) return;
+        const event = step.value;
+
+        this.logger.log({ kind: 'sweep', event });
+        classSplitCheck.observe(event);
+        if (isFinalSweepEvent(event)) {
+          summary.windows += 1;
+          summary.casesListed += event.rows.length;
+          await this.store.recordFinalEvent(event);
+          for (const row of event.rows) {
+            // Before every detail fetch: the rest of this window is left
+            // pending (a resumed run, 9b, or `drainPendingRows` picks it up).
+            const rowExceeded = this.budgetExceeded(summary);
+            if (rowExceeded !== undefined) {
+              this.stoppedBy = rowExceeded;
+              await generator.return(undefined);
+              return;
+            }
+            await this.processRow(row, summary);
+          }
+          continue;
+        }
+        // `skipped`/`rejected` (9b) carry no rows: nothing to persist, just tally.
+        if (event.type === 'skipped') summary.windowsSkipped += 1;
+        if (event.type === 'rejected') summary.windowsRejected += 1;
       }
-      // `skipped`/`rejected` (9b) carry no rows: nothing to persist, just tally.
-      if (event.type === 'skipped') summary.windowsSkipped += 1;
-      if (event.type === 'rejected') summary.windowsRejected += 1;
+    } finally {
+      classSplitCheck.finish(this.stoppedBy !== undefined);
     }
   }
 
@@ -266,10 +350,20 @@ export class Scraper {
     const caseIndex = await this.store.indexCases();
 
     for (const row of await this.store.listPendingRows()) {
+      // Same budget check as `runSweep`, before any row's detail/re-download.
+      const exceeded = this.budgetExceeded(summary);
+      if (exceeded !== undefined) {
+        this.stoppedBy = exceeded;
+        return;
+      }
+
       const stored = caseIndex.get(row.number);
       if (stored !== undefined) {
-        await this.downloadDocuments(stored, summary);
-        await this.store.completeRow(stored);
+        // Skip completeRow if the budget stopped mid-download: the row
+        // stays pending so a resumed run re-attempts only the missing PDFs.
+        if (await this.downloadDocuments(stored, summary)) {
+          await this.store.completeRow(stored);
+        }
         continue;
       }
 
@@ -313,8 +407,13 @@ export class Scraper {
     summary.casesDetailed += 1;
     this.logger.log({ kind: 'case-detailed', number: legalCase.number });
 
-    await this.downloadDocuments(legalCase, summary);
-    await this.store.completeRow(legalCase);
+    // Skip completeRow if the budget stopped mid-download: the case stays
+    // appended (still pending) so a resumed run re-attempts only the
+    // documents that never got tried - persistence was built for exactly
+    // this (see the module comment on crash safety and the resume path).
+    if (await this.downloadDocuments(legalCase, summary)) {
+      await this.store.completeRow(legalCase);
+    }
   }
 
   /**
@@ -334,11 +433,25 @@ export class Scraper {
     }
   }
 
-  /** Downloads every document of one case, recording each outcome. */
-  private async downloadDocuments(legalCase: LegalCase, summary: RunSummary): Promise<void> {
+  /**
+   * Downloads every document of one case, recording each outcome. Returns
+   * `false` if `maxRequests` was hit before every document was attempted -
+   * the caller must then leave the case's row pending (skip `completeRow`)
+   * rather than dequeue it with documents never even tried.
+   */
+  private async downloadDocuments(legalCase: LegalCase, summary: RunSummary): Promise<boolean> {
     for (const doc of legalCase.documents) {
+      // Gated per document, not just per row: a case with many documents
+      // must not be able to run the budget arbitrarily over (see
+      // `RunLimits`'s doc comment on the bounded overshoot).
+      if (this.maxRequestsExceeded()) {
+        this.stoppedBy = 'maxRequests';
+        return false;
+      }
+
       await this.downloadOne(legalCase, doc, summary);
     }
+    return true;
   }
 
   /**
@@ -415,22 +528,40 @@ export class Scraper {
    */
   async retryFailed(): Promise<RunSummary> {
     const summary = emptySummary();
+    this.stoppedBy = undefined;
 
     try {
       for (const failedCase of await this.store.listRetryableCases()) {
+        // Same budget gate as run()'s per-row check: stop before starting
+        // any further case's detail fetch once a limit is reached.
+        const exceeded = this.budgetExceeded(summary);
+        if (exceeded !== undefined) {
+          this.stoppedBy = exceeded;
+          break;
+        }
         await this.retryFailedCase(failedCase, summary);
       }
 
-      const caseIndex = await this.store.indexCases();
-      for (const failedDocument of await this.store.listRetryableDocuments()) {
-        await this.retryFailedDocument(failedDocument, caseIndex, summary);
+      if (this.stoppedBy === undefined) {
+        const caseIndex = await this.store.indexCases();
+        for (const failedDocument of await this.store.listRetryableDocuments()) {
+          // Same budget gate, before any further document's re-download.
+          const exceeded = this.budgetExceeded(summary);
+          if (exceeded !== undefined) {
+            this.stoppedBy = exceeded;
+            break;
+          }
+          await this.retryFailedDocument(failedDocument, caseIndex, summary);
+        }
       }
     } catch (error) {
+      summary.stoppedBy = this.stoppedBy;
       await this.finalizeSummary(summary);
       this.logger.log({ kind: 'run-aborted', reason: describeError(error) });
       throw new RunAbortedError(error, summary);
     }
 
+    summary.stoppedBy = this.stoppedBy;
     await this.finalizeSummary(summary);
     return summary;
   }
@@ -461,9 +592,16 @@ export class Scraper {
     summary.casesDetailed += 1;
     this.logger.log({ kind: 'case-detailed', number: legalCase.number });
 
-    await this.downloadDocuments(legalCase, summary);
+    // Same per-document gate as run()'s downloadDocuments: if the budget
+    // stops mid-case, the case's already-downloaded documents are still
+    // persisted (appendCase, below), but recordCaseSuccess is skipped so
+    // this case stays in the retry ledger for a later retryFailed() call to
+    // finish, rather than being marked fully retried when it was not.
+    const completed = await this.downloadDocuments(legalCase, summary);
     await this.store.appendCase(legalCase);
-    await this.store.recordCaseSuccess(legalCase.number);
+    if (completed) {
+      await this.store.recordCaseSuccess(legalCase.number);
+    }
   }
 
   /** Re-attempts one previously-failed document, only if its case is still on disk. */
@@ -503,6 +641,7 @@ function emptySummary(): RunSummary {
     pendingRows: 0,
     retryableCases: 0,
     retryableDocuments: 0,
+    stoppedBy: undefined,
   };
 }
 
@@ -510,4 +649,85 @@ function emptySummary(): RunSummary {
 function describeError(error: unknown): string {
   if (error instanceof Error) return `${error.name}: ${error.message}`;
   return String(error);
+}
+
+/**
+ * ISSUE-4's known gap: `JudicialClassSplit`'s completeness rests entirely on
+ * its catalog being the court's full set of classes - a silently-missing
+ * class would make every emitted class-window look uncapped while its cases
+ * go unreached. Sanity check ISSUE-4's resolution asks ISSUE-9 to run: when a
+ * day is `capped` and split `by: 'judicial-class'`, sum the rows of every
+ * child final event in that subtree (the final events at
+ * `depth === cappedDepth + 1`, until a shallower event or the sweep's end
+ * closes the subtree) and compare against the site's own cap (30). Agreement
+ * is not proof the catalog is complete, but a shortfall is strong evidence it
+ * is not - and costs nothing beyond arithmetic already in the event log.
+ *
+ * This is a **fresh-run diagnostic**: it reads the live event stream only, so
+ * two things can make its sum look smaller than the truth without indicating
+ * a missing class - neither is a defect in the check itself, just a caveat on
+ * reading its output. (1) A non-final child (a leaf a per-leaf `skipWindow`
+ * chose not to run, or one whose `search` was rejected - both arrive as
+ * non-final `SweepEvent`s once resume/retry, 9b, is wired in) means the
+ * subtree's true completeness cannot be read from this run's rows alone;
+ * `finish`/`close` suppress the verdict whenever any such event was observed
+ * in the subtree, rather than report a false shortfall. (2) Dedup against a
+ * `seen` set pre-seeded from an earlier run (also 9b) can shorten the sum for
+ * cases this run never re-lists because an earlier one already recorded them
+ * - again not a missing class, just this run seeing less of the subtree.
+ */
+const SEARCH_CAP = 30;
+
+class ClassSplitCheck {
+  private pending:
+    | { day: string; cappedDepth: number; childrenRows: number; incomplete: boolean }
+    | undefined;
+
+  constructor(private readonly logger: LogSink) {}
+
+  /** Feed every `SweepEvent` the walk yields, in order. */
+  observe(event: SweepEvent): void {
+    if (this.pending !== undefined && event.depth <= this.pending.cappedDepth) {
+      this.close(false);
+    }
+
+    if (event.type === 'capped' && event.splitBy === 'judicial-class') {
+      this.close(false); // a still-open subtree here would mean nested class splits, which cannot happen (split-once)
+      this.pending = { day: event.query.from, cappedDepth: event.depth, childrenRows: 0, incomplete: false };
+      return;
+    }
+
+    if (this.pending !== undefined && event.depth === this.pending.cappedDepth + 1) {
+      if (isFinalSweepEvent(event)) {
+        this.pending.childrenRows += event.rows.length;
+      } else {
+        // A non-final child (e.g. a skipped or rejected leaf, 9b) means this
+        // run's rows do not tell the whole story for this subtree - see the
+        // "fresh-run diagnostic" note above.
+        this.pending.incomplete = true;
+      }
+    }
+  }
+
+  /**
+   * Call once after the sweep ends, in case its last event left a subtree
+   * still open. `interrupted` must be `true` when the run stopped on a
+   * budget (`RunSummary.stoppedBy` is set): a budget can cut a class-split
+   * subtree off mid-fan-out, and reporting its partial sum as `ok: false`
+   * would be a false catalog alarm rather than real evidence of one.
+   */
+  finish(interrupted: boolean): void {
+    this.close(interrupted);
+  }
+
+  private close(interrupted: boolean): void {
+    if (this.pending === undefined) return;
+    const { day, childrenRows, incomplete } = this.pending;
+    this.pending = undefined;
+    if (interrupted || incomplete) {
+      this.logger.log({ kind: 'classSplitCheck', day, childrenRows, ok: undefined, incomplete: true });
+      return;
+    }
+    this.logger.log({ kind: 'classSplitCheck', day, childrenRows, ok: childrenRows >= SEARCH_CAP });
+  }
 }

@@ -15,9 +15,9 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { CircuitBreakerError, ParseError, RateLimitError, RejectedQueryError, UnexpectedDetailPageError } from '../src/domain/errors.js';
-import type { CaseDocument, LegalCase, Query, SearchResponse, SearchResultRow } from '../src/domain/types.js';
+import type { CaseDocument, JudicialClass, LegalCase, Query, SearchResponse, SearchResultRow } from '../src/domain/types.js';
 import { PersistenceStore } from '../src/persistence/store.js';
-import { DateRangeSplit, PartitionChain } from '../src/pipeline/partition.js';
+import { DateRangeSplit, JudicialClassSplit, PartitionChain } from '../src/pipeline/partition.js';
 import {
   RunAbortedError,
   Scraper,
@@ -25,6 +25,7 @@ import {
   type DocumentDownloader,
   type LogSink,
   type OrchestratorLogEvent,
+  type RequestCounter,
 } from '../src/pipeline/orchestrator.js';
 import type { DownloadResult } from '../src/pje/download.js';
 
@@ -120,6 +121,20 @@ function fakeDownloader(byDocId: Record<string, DownloadResult>): DocumentDownlo
 }
 
 const RANGE = { from: '2025-03-05', to: '2025-03-05' };
+
+/** A `RequestCounter` a test can bump by hand, standing in for the real `onRequest`-fed one. */
+function fakeRequestCounter(): RequestCounter & { bump(n?: number): void } {
+  let requests = 0;
+  return {
+    get requests() {
+      return requests;
+    },
+    retries429: 0,
+    bump(n = 1) {
+      requests += n;
+    },
+  };
+}
 
 describe('Scraper (orchestrator)', () => {
   let dir: string;
@@ -519,5 +534,255 @@ describe('Scraper (orchestrator)', () => {
     // of the retryable list entirely - listRetryable only returns records
     // whose latest attempt is still marked retryable.
     expect(stillRetryable).toEqual([]);
+  });
+
+  it('budget: stops at maxRequests, with stoppedBy set, and never searches again after the stop', async () => {
+    const requestCounter = fakeRequestCounter();
+    let searchCalls = 0;
+    const search = async (_query: Query): Promise<SearchResponse> => {
+      searchCalls += 1;
+      requestCounter.bump(); // mimics HttpClientOptions.onRequest firing per real search
+      return response([row(`case-${searchCalls}`)]);
+    };
+    const detail = fakeDetail({ 'ca-case-1': legalCase('case-1') });
+    const downloader = fakeDownloader({});
+    const logger = recordingLogger();
+
+    // Always splittable, so only the budget - not an exhausted chain - ends the walk.
+    const alwaysSplits: Query[] = [{ from: '2025-03-04', to: '2025-03-04' }];
+    const chain = new PartitionChain([{ name: 'never-ending', canSplit: () => true, split: () => alwaysSplits }]);
+
+    const scraper = new Scraper({ search, detail, downloader, store, chain, logger, requestCounter, limits: { maxRequests: 1 } });
+    const summary = await scraper.run(RANGE);
+
+    expect(summary.stoppedBy).toBe('maxRequests');
+    expect(searchCalls).toBe(1); // the budget check runs before the second search
+  });
+
+  it('budget: stops at maxCases after finishing the case already in flight, downloads included', async () => {
+    const search = async (_query: Query): Promise<SearchResponse> =>
+      response([row('case-a'), row('case-b')]);
+    const detail = fakeDetail({
+      'ca-case-a': legalCase('case-a', [doc('d1')]),
+      'ca-case-b': legalCase('case-b', [doc('d2')]),
+    });
+    const downloader = fakeDownloader({
+      d1: { ok: true, path: '/x/d1.pdf', bytes: 1, skipped: false },
+      d2: { ok: true, path: '/x/d2.pdf', bytes: 1, skipped: false },
+    });
+    const logger = recordingLogger();
+
+    const scraper = new Scraper({ search, detail, downloader, store, chain: noopChain(), logger, limits: { maxCases: 1 } });
+    const summary = await scraper.run(RANGE);
+
+    expect(summary.stoppedBy).toBe('maxCases');
+    expect(summary.casesDetailed).toBe(1);
+    // The case detailed before the stop still got its documents/row completed.
+    const stored = await store.indexCases();
+    expect(stored.get('case-a')?.documents[0]?.localPath).toBe('/x/d1.pdf');
+    expect(await store.listPendingRows()).toMatchObject([{ number: 'case-b' }]);
+  });
+
+  it('stoppedBy: undefined with no limits (walks out naturally); "maxCases" and still returned, not thrown, with limits: { maxCases: 0 }', async () => {
+    const search = async (_query: Query): Promise<SearchResponse> => response([row('case-a')]);
+    const detail = fakeDetail({ 'ca-case-a': legalCase('case-a') });
+    const downloader = fakeDownloader({});
+
+    const unbounded = new Scraper({ search, detail, downloader, store, chain: noopChain(), logger: recordingLogger() });
+    expect((await unbounded.run(RANGE)).stoppedBy).toBeUndefined();
+
+    // A budget stop must resolve normally (never throw RunAbortedError): it
+    // is a successful, bounded run, not an abort.
+    const bounded = new Scraper({ search, detail, downloader, store, chain: noopChain(), logger: recordingLogger(), limits: { maxCases: 0 } });
+    const summary = await bounded.run(RANGE);
+    expect(summary.stoppedBy).toBe('maxCases');
+    expect(summary.casesDetailed).toBe(0);
+  });
+
+  it.each([
+    // [classA rows, classB rows, expected ok] - the real acceptance bar is
+    // childrenRows >= 30 (ISSUE-4's resolution): the second row is what a
+    // silently-missing class from the catalog would look like.
+    [20, 15, true],
+    [5, 4, false],
+  ])(
+    'classSplitCheck: a capped day split by judicial-class logs childrenRows summed across its children, ok = sum >= 30 (%i + %i -> ok=%s)',
+    async (classARows, classBRows, expectedOk) => {
+      const chain = new PartitionChain([
+        new DateRangeSplit(),
+        new JudicialClassSplit([
+          { id: '1', name: 'Class A' } satisfies JudicialClass,
+          { id: '2', name: 'Class B' } satisfies JudicialClass,
+        ]),
+      ]);
+      const rows = (n: number, prefix: string): SearchResultRow[] =>
+        Array.from({ length: n }, (_, i) => row(`${prefix}-${i}`));
+
+      const search = async (query: Query): Promise<SearchResponse> => {
+        if (query.judicialClassId === undefined) return response(rows(30, 'day1'), true);
+        if (query.judicialClassId === '1') return response(rows(classARows, 'a'));
+        return response(rows(classBRows, 'b'));
+      };
+      const logger = recordingLogger();
+      const scraper = new Scraper({
+        search,
+        detail: fakeDetail({}), // never consulted: no downloads driven in this test
+        downloader: fakeDownloader({}),
+        store,
+        chain,
+        logger,
+      });
+      await scraper.run(RANGE);
+
+      const check = logger.events.find((e) => e.kind === 'classSplitCheck');
+      expect(check).toMatchObject({
+        kind: 'classSplitCheck',
+        day: '2025-03-05',
+        childrenRows: classARows + classBRows,
+        ok: expectedOk,
+      });
+    },
+  );
+
+  it('budget: maxRequests gates per document, not just per case - the row stays pending and completeRow is not called', async () => {
+    // requestCounter reaches the budget exactly when detail.fetch runs (a
+    // stand-in for HttpClientOptions.onRequest firing on the real request
+    // detail makes) - i.e. AFTER the sweep's own pre-search check passed,
+    // but BEFORE any document download is attempted.
+    const requestCounter = fakeRequestCounter();
+    const search = async (_query: Query): Promise<SearchResponse> => response([row('case-a')]);
+    const documents = [doc('d1'), doc('d2')];
+    const detail: DetailFetcher = {
+      async fetch(_ca, _expectedNumber) {
+        requestCounter.bump(1);
+        return legalCase('case-a', documents);
+      },
+    };
+    const downloader = fakeDownloader({
+      d1: { ok: true, path: '/x/d1.pdf', bytes: 1, skipped: false },
+      d2: { ok: true, path: '/x/d2.pdf', bytes: 1, skipped: false },
+    });
+    const logger = recordingLogger();
+
+    const scraper = new Scraper({ search, detail, downloader, store, chain: noopChain(), logger, requestCounter, limits: { maxRequests: 1 } });
+    const summary = await scraper.run(RANGE);
+
+    expect(summary.stoppedBy).toBe('maxRequests');
+    expect(downloader.calls).toEqual([]); // gated before the first document attempt
+    // The case was appended (still pending), never completeRow'd: a resumed
+    // run re-attempts only the documents that never got tried.
+    expect(await store.hasCase('case-a')).toBe(true);
+    expect(await store.listPendingRows()).toMatchObject([{ number: 'case-a' }]);
+  });
+
+  it('classSplitCheck: a budget stop (interrupted) suppresses the verdict instead of reporting a partial sum as ok: false', async () => {
+    const classA: JudicialClass = { id: '1', name: 'Class A' };
+    const classB: JudicialClass = { id: '2', name: 'Class B' };
+    const chain = new PartitionChain([new DateRangeSplit(), new JudicialClassSplit([classA, classB])]);
+    const rows = (n: number, prefix: string): SearchResultRow[] =>
+      Array.from({ length: n }, (_, i) => row(`${prefix}-${i}`));
+
+    const requestCounter = fakeRequestCounter();
+    let searchCalls = 0;
+    const search = async (query: Query): Promise<SearchResponse> => {
+      searchCalls += 1;
+      requestCounter.bump(1); // one "request" per search, like the real onRequest
+      if (query.judicialClassId === undefined) return response(rows(30, 'day1'), true);
+      // Only class A's window is ever reached before the budget stops the walk.
+      return response(rows(5, 'a'));
+    };
+    const logger = recordingLogger();
+    const scraper = new Scraper({
+      search,
+      detail: fakeDetail({}),
+      downloader: fakeDownloader({}),
+      store,
+      chain,
+      logger,
+      requestCounter,
+      limits: { maxRequests: 2 }, // the capped day + class A's window, no more
+    });
+    const summary = await scraper.run(RANGE);
+
+    expect(summary.stoppedBy).toBe('maxRequests');
+    expect(searchCalls).toBe(2);
+    const check = logger.events.find((e) => e.kind === 'classSplitCheck');
+    // A partial sum (5 rows, far short of 30) must NOT be reported as
+    // ok: false - the run was interrupted, not a sign of a missing class.
+    expect(check).toMatchObject({ kind: 'classSplitCheck', ok: undefined, incomplete: true });
+  });
+
+  it('classSplitCheck: a skipped child (resume, 9b) suppresses the verdict instead of reporting a short sum as ok: false', async () => {
+    const classA: JudicialClass = { id: '1', name: 'Class A' };
+    const classB: JudicialClass = { id: '2', name: 'Class B' };
+    const chain = new PartitionChain([new DateRangeSplit(), new JudicialClassSplit([classA, classB])]);
+    const rows = (n: number, prefix: string): SearchResultRow[] =>
+      Array.from({ length: n }, (_, i) => row(`${prefix}-${i}`));
+
+    // Pre-record class A's window as already covered (as an earlier run
+    // would have left it), so this run's sweep skips it via skipWindow.
+    const classAQuery: Query = { from: '2025-03-05', to: '2025-03-05', judicialClassId: '1', judicialClassName: 'Class A' };
+    await store.recordFinalEvent({ type: 'window', query: classAQuery, rows: rows(25, 'a'), depth: 1 });
+
+    const search = async (query: Query): Promise<SearchResponse> => {
+      if (query.judicialClassId === undefined) return response(rows(30, 'day1'), true);
+      // Only class B's window is ever actually searched: class A is skipped.
+      return response(rows(5, 'b'));
+    };
+    const logger = recordingLogger();
+    const scraper = new Scraper({
+      search,
+      detail: fakeDetail({}),
+      downloader: fakeDownloader({}),
+      store,
+      chain,
+      logger,
+    });
+    await scraper.run(RANGE);
+
+    expect(logger.events.some((e) => e.kind === 'sweep' && e.event.type === 'skipped')).toBe(true);
+    const check = logger.events.find((e) => e.kind === 'classSplitCheck');
+    // Only class B's 5 rows were actually summed (class A was skipped, not
+    // searched) - far short of 30, but must NOT be reported as ok: false:
+    // the skipped child means this run's sum does not tell the whole story.
+    expect(check).toMatchObject({ kind: 'classSplitCheck', ok: undefined, incomplete: true });
+  });
+
+  it('retryFailed (9b): the budget gates its case/document retry loops too, stopping before the second failed case', async () => {
+    const search = async (): Promise<SearchResponse> => response([row('case-bad-1'), row('case-bad-2')]);
+    const failing: DetailFetcher = {
+      async fetch(): Promise<LegalCase> {
+        throw new ParseError('missing case number', 'missing case number');
+      },
+    };
+    const { scraper } = makeScraper({ search, detail: failing, downloader: fakeDownloader({}) });
+    await scraper.run(RANGE);
+    expect(await store.listRetryableCases()).toHaveLength(2);
+
+    const requestCounter = fakeRequestCounter();
+    let retryFetches = 0;
+    const detail: DetailFetcher = {
+      async fetch(): Promise<LegalCase> {
+        retryFetches += 1;
+        requestCounter.bump(1);
+        return legalCase(`case-bad-${retryFetches}`);
+      },
+    };
+    const bounded = new Scraper({
+      search,
+      detail,
+      downloader: fakeDownloader({}),
+      store,
+      chain: noopChain(),
+      logger: recordingLogger(),
+      requestCounter,
+      limits: { maxRequests: 1 },
+    });
+
+    const summary = await bounded.retryFailed();
+
+    expect(summary.stoppedBy).toBe('maxRequests');
+    expect(retryFetches).toBe(1); // only the first failed case was retried
+    expect(await store.listRetryableCases()).toHaveLength(1); // the second is still pending retry
   });
 });
