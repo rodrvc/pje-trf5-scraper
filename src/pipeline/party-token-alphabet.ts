@@ -19,7 +19,10 @@
  * stack (`delayMs: 1600`). An earlier measurement pass mistakenly ran this
  * comparison against "day + class 202" - see the resolution's note on the
  * class-filter bug that produced that leaf by accident; this table replaces
- * it and is the one the alphabet decision rests on.
+ * it and is the one the alphabet decision rests on. The order below reflects
+ * that measurement run (`DE A`/`ER A` were tried at positions 1 and 11); the
+ * shipped alphabet's actual order is different - see the note after the
+ * table.
  *
  * | # | Filter    | Rows | Capped  | New | Union |
  * |---|-----------|------|---------|-----|-------|
@@ -42,9 +45,14 @@
  * (Seed: the unfiltered response itself, 30 rows, already folded into the
  * union before filter 1 runs - see `party-sweep.ts`. Rows for `DE A` and
  * `ER A` are shown but their "New"/"Union" columns are marked "-": both hit
- * the 30-row cap themselves, so their contribution is untrustworthy and is
- * excluded from the flat-streak count and the union tally - the same rule
- * applied to the single-letter alphabet below.)
+ * the 30-row cap themselves, so their own silence - had they added nothing -
+ * would have been untrustworthy as plateau evidence. In this run both
+ * actually happened to add nothing new against the union at the point they
+ * ran, but that is incidental to the point being illustrated: a capped
+ * filter's rows are still merged into the union either way (they are real,
+ * verified cases - see `party-sweep.ts`'s `grew` check, which runs before
+ * the capped/uncapped distinction), only its *silence* is excluded from
+ * counting as flat-streak evidence, never the union itself.)
  *
  * The union plateaus at **46** starting at filter 13 (`TE S`); filters 14-15
  * add nothing further. A follow-up probe with 7 more tokens not in this
@@ -63,19 +71,32 @@
  * two of fifteen digraph/trigram filters were still capped here, and single
  * letters would be capped far more often, which defeats the purpose of using
  * a filter as a *cover* signal at all: a capped filter's own rows are
- * silently incomplete, so it cannot be trusted to report "no new cases", only
- * "no new cases *among the ones shown*". `PARTY_TOKEN_ALPHABET` holds the
- * chosen 15 tokens, in one place, with this table and reasoning alongside it
- * so `party-sweep.ts` itself does not need to justify the choice.
+ * silently incomplete, so its *silence* cannot be trusted as "no new cases",
+ * only as "no new cases *among the ones shown*" - though a capped filter
+ * that DOES add new cases is still real, positive evidence and is treated as
+ * such (see `party-sweep.ts`). `PARTY_TOKEN_ALPHABET` holds the chosen 15
+ * tokens, in one place, with this table and reasoning alongside it so
+ * `party-sweep.ts` itself does not need to justify the choice.
  *
- * Ordered roughly by expected frequency in Portuguese surnames/given names
- * (per digraph/trigram frequency intuition, not a formal corpus count):
- * "DE", "DA", "OS", "NT", "ES", "RA", "AN", "IN", "RI", "DO", "ER", "CO",
- * "TE", "AL", "UZ", each paired with a second short, common fragment so the
- * "at least two tokens" validation passes.
+ * **Shipped order: the two known-capping tokens (`DE A`, `ER A`) moved to the
+ * end.** The measurement above shows they carry the least trustworthy
+ * individual evidence of the fifteen (their silence, unlike every other
+ * token's, cannot count toward a plateau) - so a leaf should spend its
+ * cheaper, more informative uncapped tokens first and only reach for the
+ * capped ones once those are exhausted, rather than risk finishing early on
+ * two low-evidence requests near the front of a short run. This does not
+ * change the plateau point measured above (union growth is order-independent
+ * for the underlying data; only when a filter with known-untrustworthy
+ * silence gets tried is affected), it only improves where a request budget
+ * gets spent.
+ *
+ * Otherwise ordered roughly by expected frequency in Portuguese surnames/
+ * given names (per digraph/trigram frequency intuition, not a formal corpus
+ * count): "DA", "OS", "NT", "ES", "RA", "AN", "IN", "RI", "DO", "CO", "TE",
+ * "AL", "UZ", "DE", "ER", each paired with a second short, common fragment so
+ * the "at least two tokens" validation passes.
  */
 export const PARTY_TOKEN_ALPHABET: readonly string[] = [
-  'DE A',
   'DA S',
   'OS S',
   'NT O',
@@ -85,9 +106,10 @@ export const PARTY_TOKEN_ALPHABET: readonly string[] = [
   'IN A',
   'RI A',
   'DO S',
-  'ER A',
   'CO S',
   'TE S',
   'AL V',
   'UZ A',
+  'DE A',
+  'ER A',
 ];
