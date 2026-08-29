@@ -132,8 +132,66 @@ The smoke script itself (`scripts/smoke-orchestrator.ts`) is not part of this
 PR - moved out during review to stay within the diff-size target - and will
 land with 9c, which does the equivalent demo run for budgets/limits.
 
-**Deferred to 9b**: resume across runs (skipping already-covered windows via
-`isCovered`, retrying previously-failed cases/documents via
-`listRetryableCases`/`listRetryableDocuments`).
 **Deferred to 9c**: request budgets (`maxRequests`) and any other run-limit
 policy.
+
+## Resolution (part 2 of 3: resume and retry)
+
+Status stays `todo`: this closes resume-across-runs and `--retry-failed`;
+request budgets/limits (9c) are still to come and will close the issue.
+
+**`sweep.ts`**: added `SweepOptions.skipWindow?(query): boolean`, checked
+before `search(query)` for every leaf the walk visits. A match yields a new,
+non-final `skipped` event and the leaf does not recurse - `search` is never
+called for it at all. Typically wired to `store.rebuildCoveredPredicate()`,
+so a resumed run never re-requests a window an earlier run already recorded
+as a final event. Matching is exact-leaf only: a capped ancestor of an
+already-covered subtree was never itself a final event (it was split), so it
+does not match and gets re-requested on resume - one extra search per
+internal node on the covered path, documented as acceptable rather than
+taught to reason about whole subtrees (which would mean reimplementing
+`PartitionChain`'s own splitting logic).
+
+Also in `sweep.ts`: `RejectedQueryError` is now caught **per leaf**, inside
+`walk`, instead of propagating out of the whole generator. A rejected leaf
+yields a new, non-final `rejected` event and the walk continues with that
+leaf's siblings - the part 1 policy table's worst gap (one malformed query
+ending the entire run) is closed. Both `skipped` and `rejected` carry no
+`rows` and are never deduplicated or recorded as covered - they are purely
+informational for a log sink.
+
+**`orchestrator.ts`**:
+
+- `runSweep` now builds `seen` from `store.rebuildSeenSet()` and `skipWindow`
+  from `store.rebuildCoveredPredicate()` (unless `seen` was injected) and
+  passes both into `sweep()`. The failure-policy table's `RejectedQueryError`
+  row is updated: the leaf is skipped and logged, the walk continues, no
+  `RunAbortedError`. The now-obsolete `sweep-rejected` log kind is removed -
+  a rejected leaf is just another `SweepEvent` logged through the existing
+  `{ kind: 'sweep' }` case.
+- New `retryFailed()`: a second pass over `store.listRetryableCases()` and
+  `store.listRetryableDocuments()`, independent of any sweep. A retried case
+  goes through the same store flow as a fresh row (`appendCase` pending,
+  download its documents, `completeRow`), then `recordCaseSuccess` clears it
+  from the ledger. A retried document re-attempts only that one document (by
+  handing `downloadDocuments` a single-document view of its case, so the
+  case's other documents are left untouched) and only if its case is still
+  on disk. Returns the same `RunSummary` type as `run()`.
+- `emptySummary()` factors out the zeroed-tally literal `run()` and
+  `retryFailed()` both start from, so their thirteen fields cannot drift out
+  of sync with each other.
+
+**Tests**: two new `test/sweep.test.ts` cases (a skipped window is never
+searched; a rejected leaf is logged and the walk continues with its
+siblings) and five new `test/orchestrator.test.ts` cases - a window already
+recorded as final is skipped on a second run and never re-listed; running
+the same range twice (simulating a kill-and-restart) produces no duplicate
+cases and no re-downloads; `retryFailed` re-fetches a failed case and clears
+it from the ledger; `retryFailed` re-downloads only the one previously-failed
+document, leaving its case's other documents untouched; and the existing
+`RejectedQueryError` policy test is updated for the new continue-not-abort
+behaviour. `npm test`: 223/223 green. `npm run typecheck` (`tsc --noEmit`):
+clean.
+
+**Deferred to 9c**: request budgets (`maxRequests`) and any other run-limit
+policy, and `scripts/smoke-orchestrator.ts`.
