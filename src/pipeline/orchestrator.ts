@@ -6,9 +6,8 @@
  * flags and instantiates a `Scraper`; every decision about what to do with a
  * sweep event, a failed detail fetch or a failed download lives here.
  *
- * This PR builds only the loop and its failure policy. Resume/retry is 9b;
- * request budgets and rate limits are 9c - see the TODOs on `ScraperOptions`
- * for the exact seams each is meant to plug into.
+ * The loop and its failure policy are part 1; resume/retry (9b) is now here
+ * too. Request budgets and rate limits (9c) remain a TODO on `ScraperOptions`.
  *
  * Rows are detailed as soon as their window is recorded (interleaved with the
  * sweep), not after the whole range has been walked: the sweep already walks
@@ -25,7 +24,7 @@
  * | Failure | Action |
  * |---|---|
  * | `detail.fetch` throws anything **except** `CircuitBreakerError` (`ParseError`, `UnexpectedDetailPageError`, an exhausted `RateLimitError`, a raw network error, ...) | `store.recordCaseFailure({ retryable: true, reason: "<ErrorName>: <message>" })`, dequeue the row, continue with the next row |
- * | `search` throws `RejectedQueryError` | **the whole `sweep()` walk ends** (it catches nothing itself - see `sweep.ts`): logged as a sweep-level failure against the run's root query, remaining windows of this run are simply never listed. They are not lost forever - a resumed run (9b) re-walks unrecorded windows - but this run does not retry them itself. Catching per-leaf, inside `sweep()`, so one rejected leaf does not end the whole walk, is left as a 9b follow-up |
+ * | `search` throws `RejectedQueryError` for one leaf | (9b) `sweep()` catches this per leaf, yielding a `rejected` event: the walk continues with that leaf's siblings, no `RunAbortedError` |
  * | a document download fails - `DownloadResult` with `ok: false`, or `downloader.download` itself throwing anything **except** `CircuitBreakerError` | `store.recordDocumentFailure(...)`, continue with the next document |
  * | `CircuitBreakerError`, from detail, download or the sweep | finish the writes already in flight for the current row, then throw `RunAbortedError` carrying the summary so far - abort the run cleanly |
  *
@@ -55,10 +54,10 @@
  * whatever did not) and only then `completeRow`'d.
  */
 
-import type { CaseDocument, LegalCase, Query, SearchResultRow } from '../domain/types.js';
-import { CircuitBreakerError, RejectedQueryError } from '../domain/errors.js';
+import type { CaseDocument, LegalCase, SearchResultRow } from '../domain/types.js';
+import { CircuitBreakerError } from '../domain/errors.js';
 import type { DownloadResult } from '../pje/download.js';
-import type { PersistenceStore } from '../persistence/store.js';
+import type { CaseFailureRecord, FailedDocumentRecord, PersistenceStore } from '../persistence/store.js';
 import { isFinalSweepEvent } from '../persistence/store.js';
 import { sweep, type CoverFn, type SeenSet, type SearchFn, type SweepEvent } from './sweep.js';
 import type { PartitionChain } from './partition.js';
@@ -76,7 +75,6 @@ export interface DocumentDownloader {
 /** Everything the orchestrator logs, so a CLI (or a test) can render it however it likes. */
 export type OrchestratorLogEvent =
   | { kind: 'sweep'; event: SweepEvent }
-  | { kind: 'sweep-rejected'; query: Query; message: string }
   | { kind: 'case-detailed'; number: string }
   | { kind: 'case-failed'; number: string; reason: string }
   | { kind: 'document-downloaded'; caseNumber: string; documentId: string; skipped: boolean }
@@ -145,12 +143,12 @@ export interface ScraperOptions {
   chain: PartitionChain;
   cover?: CoverFn;
   logger: LogSink;
-  /** Dedup state across the run. Defaults to the store's own rebuilt seen-set when omitted. */
+  /**
+   * Dedup state across the run. Defaults to `store.rebuildSeenSet()` when
+   * omitted, so a resumed run's dedup picks up exactly where an earlier run
+   * left off instead of re-registering (and re-listing) cases already found.
+   */
   seen?: SeenSet;
-  // TODO(9b): accept a `skipWindow?(query: Query): boolean` predicate (e.g.
-  // from `store.rebuildCoveredPredicate()`) and thread it into `sweep()` as a
-  // new `SweepOptions.skipWindow` - there is no pre-search "don't even run
-  // this query" hook in `sweep.ts` today, only post-hoc dedup via `seen`.
   // TODO(9c): accept a `maxRequests` budget and stop the walk once
   // `requestCounter.requests` reaches it.
   requestCounter?: RequestCounter;
@@ -181,21 +179,7 @@ export class Scraper {
 
   /** Runs the full sweep -> detail -> PDFs -> persistence flow for one date range. */
   async run(range: { from: string; to: string }): Promise<RunSummary> {
-    const summary: RunSummary = {
-      windows: 0,
-      casesListed: 0,
-      casesDetailed: 0,
-      casesFailed: 0,
-      documentsDownloaded: 0,
-      documentsSkipped: 0,
-      documentsFailed: 0,
-      requests: 0,
-      retries429: 0,
-      casesOnDisk: 0,
-      pendingRows: 0,
-      retryableCases: 0,
-      retryableDocuments: 0,
-    };
+    const summary = emptySummary();
 
     try {
       await this.runSweep(range, summary);
@@ -228,41 +212,34 @@ export class Scraper {
    * Walks the sweep, persisting and detailing each final event's rows as
    * they arrive - see the module comment on why detailing is interleaved
    * with the walk rather than deferred to one pass at the end.
+   *
+   * `seen` and `skipWindow` (9b) both default to a rebuild from `store` when
+   * not explicitly injected - see `SweepOptions.skipWindow` for the exact
+   * (leaf-only) matching semantics `rebuildCoveredPredicate` has.
    */
   private async runSweep(range: { from: string; to: string }, summary: RunSummary): Promise<void> {
     const seen = this.seen ?? (await this.store.rebuildSeenSet());
+    const skipWindow = await this.store.rebuildCoveredPredicate();
 
-    try {
-      for await (const event of sweep({
-        from: range.from,
-        to: range.to,
-        search: this.search,
-        chain: this.chain,
-        ...(this.cover !== undefined ? { cover: this.cover } : {}),
-        seen,
-      })) {
-        this.logger.log({ kind: 'sweep', event });
-        if (isFinalSweepEvent(event)) {
-          summary.windows += 1;
-          summary.casesListed += event.rows.length;
-          await this.store.recordFinalEvent(event);
-          for (const row of event.rows) {
-            await this.processRow(row, summary);
-          }
+    for await (const event of sweep({
+      from: range.from,
+      to: range.to,
+      search: this.search,
+      chain: this.chain,
+      ...(this.cover !== undefined ? { cover: this.cover } : {}),
+      seen,
+      skipWindow,
+    })) {
+      this.logger.log({ kind: 'sweep', event });
+      if (isFinalSweepEvent(event)) {
+        summary.windows += 1;
+        summary.casesListed += event.rows.length;
+        await this.store.recordFinalEvent(event);
+        for (const row of event.rows) {
+          await this.processRow(row, summary);
         }
       }
-    } catch (error) {
-      // A rejected query ends the whole walk (`sweep()` catches nothing of
-      // its own - see that module's error-policy comment): there is no leaf
-      // to resume from here, only the run's root query to log against. See
-      // the module comment's policy table for why this is a known,
-      // documented gap rather than a silent one, and why per-leaf catching
-      // belongs to 9b rather than this PR.
-      if (error instanceof RejectedQueryError) {
-        this.logger.log({ kind: 'sweep-rejected', query: range, message: error.message });
-        return;
-      }
-      throw error;
+      // `skipped`/`rejected` (9b) carry no rows: nothing further to persist.
     }
   }
 
@@ -384,6 +361,99 @@ export class Scraper {
       });
     }
   }
+
+  /**
+   * `--retry-failed` (9b): re-attempts every case whose detail fetch
+   * previously failed and every document whose download previously failed -
+   * a second pass over the two failure ledgers, no sweep involved.
+   *
+   * A retried case goes through the same store flow as a fresh row
+   * (`appendCase` pending, download, `completeRow`), then `recordCaseSuccess`
+   * clears it from the ledger. A retried document re-attempts only that one
+   * (see `retryFailedDocument`), and only if its case is still on disk - a
+   * missing case would mean the case store was tampered with, not a normal
+   * retry scenario, so it is skipped rather than guessed at.
+   */
+  async retryFailed(): Promise<RunSummary> {
+    const summary = emptySummary();
+
+    for (const failedCase of await this.store.listRetryableCases()) {
+      await this.retryFailedCase(failedCase, summary);
+    }
+
+    const caseIndex = await this.store.indexCases();
+    for (const failedDocument of await this.store.listRetryableDocuments()) {
+      await this.retryFailedDocument(failedDocument, caseIndex, summary);
+    }
+
+    await this.finalizeSummary(summary);
+    return summary;
+  }
+
+  /** Re-fetches one previously-failed case's detail, same store flow as a fresh row. */
+  private async retryFailedCase(failed: CaseFailureRecord, summary: RunSummary): Promise<void> {
+    let legalCase: LegalCase;
+    try {
+      legalCase = await this.detail.fetch(failed.ca, failed.caseNumber);
+    } catch (error) {
+      if (error instanceof CircuitBreakerError) throw error;
+
+      const reason = describeError(error);
+      await this.store.recordCaseFailure({
+        caseNumber: failed.caseNumber,
+        ca: failed.ca,
+        reason,
+        attempt: failed.attempt + 1,
+        retryable: true,
+      });
+      summary.casesFailed += 1;
+      this.logger.log({ kind: 'case-failed', number: failed.caseNumber, reason });
+      return;
+    }
+
+    await this.store.appendCase(legalCase);
+    summary.casesDetailed += 1;
+    this.logger.log({ kind: 'case-detailed', number: legalCase.number });
+
+    await this.downloadDocuments(legalCase, summary);
+    await this.store.completeRow(legalCase);
+    await this.store.recordCaseSuccess(legalCase.number);
+  }
+
+  /** Re-attempts one previously-failed document, only if its case is still on disk. */
+  private async retryFailedDocument(
+    failed: FailedDocumentRecord,
+    caseIndex: Map<string, LegalCase>,
+    summary: RunSummary,
+  ): Promise<void> {
+    const legalCase = caseIndex.get(failed.caseNumber);
+    const doc = legalCase?.documents.find((d) => d.download.idProcessoDocumento === failed.documentId);
+    if (legalCase === undefined || doc === undefined) return;
+
+    // A single-document view: downloadDocuments iterates `.documents`, so
+    // narrowing it here re-attempts only this document, not the case's others.
+    await this.downloadDocuments({ ...legalCase, documents: [doc] }, summary);
+    await this.store.completeRow(legalCase);
+  }
+}
+
+/** A zeroed `RunSummary`, shared by `run()` and `retryFailed()` so their starting tallies never drift apart. */
+function emptySummary(): RunSummary {
+  return {
+    windows: 0,
+    casesListed: 0,
+    casesDetailed: 0,
+    casesFailed: 0,
+    documentsDownloaded: 0,
+    documentsSkipped: 0,
+    documentsFailed: 0,
+    requests: 0,
+    retries429: 0,
+    casesOnDisk: 0,
+    pendingRows: 0,
+    retryableCases: 0,
+    retryableDocuments: 0,
+  };
 }
 
 /** `"ErrorName: message"`, so a recorded failure's reason names the error kind, not just its text. */

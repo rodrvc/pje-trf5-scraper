@@ -5,7 +5,7 @@
  * style as `test/persistence-store.test.ts`), no network. One test per row
  * of the module's failure-policy table, plus the happy path, the crash
  * safety around detail-then-downloads, the already-indexed-row resume path,
- * and the summary counts.
+ * the summary counts, and (9b) resume-across-runs and `retryFailed`.
  */
 
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -291,7 +291,7 @@ describe('Scraper (orchestrator)', () => {
     expect(await store.hasCase('case-good')).toBe(true);
   });
 
-  it('policy: RejectedQueryError from search ends the sweep, logged as a sweep-level failure', async () => {
+  it('policy: RejectedQueryError from search is logged as a rejected leaf, the run continues (9b)', async () => {
     const search = async (_query: Query): Promise<SearchResponse> => {
       throw new RejectedQueryError('rejected', 'server message');
     };
@@ -302,8 +302,9 @@ describe('Scraper (orchestrator)', () => {
     const scraper = new Scraper({ search, detail, downloader, store, chain: noopChain(), logger });
     const summary = await scraper.run(RANGE);
 
+    // The run itself completes normally (no thrown error, no RunAbortedError).
     expect(summary.windows).toBe(0);
-    expect(logger.events.some((e) => e.kind === 'sweep-rejected')).toBe(true);
+    expect(logger.events.some((e) => e.kind === 'sweep' && e.event.type === 'rejected')).toBe(true);
   });
 
   it('policy: a document failure is recorded and the run continues to the next document', async () => {
@@ -376,5 +377,113 @@ describe('Scraper (orchestrator)', () => {
       retryableCases: 1,
       retryableDocuments: 0,
     });
+  });
+
+  /** Builds one `Scraper` wired to the shared temp-dir `store`, a fresh logger each time. */
+  function makeScraper(overrides: {
+    search: (query: Query) => Promise<SearchResponse>;
+    detail: DetailFetcher;
+    downloader: DocumentDownloader;
+  }): { scraper: Scraper; logger: LogSink & { events: OrchestratorLogEvent[] } } {
+    const logger = recordingLogger();
+    const scraper = new Scraper({ ...overrides, store, chain: noopChain(), logger });
+    return { scraper, logger };
+  }
+
+  it('resume (9b): a window already recorded as a final event is skipped and not re-listed', async () => {
+    const detail = fakeDetail({ 'ca-case-a': legalCase('case-a', [doc('d1')]) });
+    const downloader = fakeDownloader({
+      d1: { ok: true, path: '/data/pdfs/case-a/d1.pdf', bytes: 100, skipped: false },
+    });
+
+    const search = async (): Promise<SearchResponse> => response([row('case-a')]);
+    await makeScraper({ search, detail, downloader }).scraper.run(RANGE);
+
+    // Second run over the same range: search must never be called again for
+    // this window, since it is already recorded as a final event.
+    const searchCalls: Query[] = [];
+    const second = makeScraper({
+      search: async (query) => {
+        searchCalls.push(query);
+        return response([row('case-a')]);
+      },
+      detail,
+      downloader,
+    });
+    const summary = await second.scraper.run(RANGE);
+
+    expect(searchCalls).toEqual([]);
+    expect(summary).toMatchObject({ windows: 0, casesListed: 0 });
+    expect(await store.listPendingRows()).toEqual([]);
+    expect(second.logger.events.some((e) => e.kind === 'sweep' && e.event.type === 'skipped')).toBe(true);
+  });
+
+  it('resume (9b): running the same range twice produces no duplicate cases and no re-downloads', async () => {
+    // Simulates a killed-then-restarted run: the same configuration driven
+    // twice against the same on-disk store.
+    const search = async (): Promise<SearchResponse> => response([row('case-a')]);
+    const detail = fakeDetail({ 'ca-case-a': legalCase('case-a', [doc('d1')]) });
+    const downloader = fakeDownloader({
+      d1: { ok: true, path: '/data/pdfs/case-a/d1.pdf', bytes: 100, skipped: false },
+    });
+
+    await makeScraper({ search, detail, downloader }).scraper.run(RANGE);
+    const second = await makeScraper({ search, detail, downloader }).scraper.run(RANGE);
+
+    expect(second.casesDetailed).toBe(0); // no second detail fetch for case-a
+    expect(second.documentsDownloaded).toBe(0); // d1 already had a localPath: free skip only
+    expect(second.casesOnDisk).toBe(1);
+    expect((await store.indexCases()).size).toBe(1);
+    // Across both runs, only the first actually "downloaded" d1.
+    expect(downloader.calls.filter((id) => id === 'd1')).toHaveLength(1);
+  });
+
+  it('retryFailed (9b): re-fetches a previously-failed case and clears it from the retry ledger', async () => {
+    const search = async (): Promise<SearchResponse> => response([row('case-bad')]);
+    let attempt = 0;
+    const detail: DetailFetcher = {
+      async fetch(): Promise<LegalCase> {
+        attempt += 1;
+        if (attempt === 1) throw new ParseError('missing case number', 'missing case number');
+        return legalCase('case-bad');
+      },
+    };
+    const { scraper } = makeScraper({ search, detail, downloader: fakeDownloader({}) });
+    await scraper.run(RANGE);
+    expect(await store.listRetryableCases()).toHaveLength(1);
+
+    const summary = await scraper.retryFailed();
+
+    expect(summary).toMatchObject({ casesDetailed: 1, casesFailed: 0 });
+    expect(await store.hasCase('case-bad')).toBe(true);
+    expect(await store.listRetryableCases()).toEqual([]);
+  });
+
+  it('retryFailed (9b): re-downloads only the one previously-failed document', async () => {
+    const search = async (): Promise<SearchResponse> => response([row('case-a')]);
+    const detail = fakeDetail({ 'ca-case-a': legalCase('case-a', [doc('d1'), doc('d2')]) });
+    // First run: d1 fails, d2 succeeds. Then d1 is scripted to succeed, so
+    // retryFailed's re-attempt can be told apart from a fresh run's attempt.
+    const outcomes: Record<string, DownloadResult> = {
+      d1: { ok: false, reason: 'HTTP 429', status: 429, retryable: true, sessionAttempts: 1 },
+      d2: { ok: true, path: '/data/pdfs/case-a/d2.pdf', bytes: 50, skipped: false },
+    };
+    const downloader = fakeDownloader(outcomes);
+    await makeScraper({ search, detail, downloader }).scraper.run(RANGE);
+    expect(await store.listRetryableDocuments()).toHaveLength(1);
+
+    downloader.calls.length = 0;
+    outcomes.d1 = { ok: true, path: '/data/pdfs/case-a/d1.pdf', bytes: 10, skipped: false };
+    const { scraper: retryScraper } = makeScraper({ search, detail, downloader });
+
+    const summary = await retryScraper.retryFailed();
+
+    // Only d1 (the failed one) was re-attempted, not d2 (which never failed).
+    expect(downloader.calls).toEqual(['d1']);
+    expect(summary).toMatchObject({ documentsDownloaded: 1, documentsFailed: 0 });
+    expect(await store.listRetryableDocuments()).toEqual([]);
+    const stored = await store.indexCases();
+    const d1 = stored.get('case-a')?.documents.find((d) => d.download.idProcessoDocumento === 'd1');
+    expect(d1?.localPath).toBe('/data/pdfs/case-a/d1.pdf');
   });
 });
