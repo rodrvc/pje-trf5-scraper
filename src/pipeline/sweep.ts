@@ -12,14 +12,18 @@
  * Kept pure with respect to I/O: `search` is injected, so the whole walk is
  * testable with a scripted fake and no network (see test/sweep.test.ts).
  *
- * Error policy: this generator does not catch anything from `search`. A throw
+ * Error policy: this generator does not catch anything from `search`, with
+ * one exception (9b): `RejectedQueryError` is caught per leaf and turned into
+ * a `rejected` event, so the walk continues with that leaf's siblings - the
+ * server has already told us the query is malformed, so retrying it
+ * unchanged would just repeat the rejection. Every other error still
  * propagates out of the `for await` loop the caller is driving, aborting the
- * walk; every event already yielded still stands (a `for await` consumer has
- * already seen and can keep them). Deciding whether to retry, skip the query,
- * or give up the whole run is the runner's job (ISSUE-7), not this function's.
+ * walk (every event already yielded still stands). Deciding what to do about
+ * those is the runner's job (ISSUE-9), not this function's.
  */
 
 import type { Query, SearchResponse, SearchResultRow } from '../domain/types.js';
+import { RejectedQueryError } from '../domain/errors.js';
 import type { PartitionChain } from './partition.js';
 
 /** Signature every search function passed to the sweep (and the cover hook) must satisfy. */
@@ -57,6 +61,11 @@ export interface SeenSet {
  * part of the output, or it will double-count and could even (if it also
  * marked them "seen") make the real, final sighting of those cases look like
  * a duplicate to be dropped.
+ *
+ * `skipped` and `rejected` (9b) are neither final nor carry `rows`: `skipped`
+ * means `search` was never called for this leaf (see `SweepOptions.skipWindow`),
+ * `rejected` means it threw `RejectedQueryError` and the leaf was abandoned.
+ * Both are purely informational - nothing to dedupe or record as covered.
  */
 export type SweepEvent =
   | {
@@ -119,6 +128,27 @@ export type SweepEvent =
       depth: number;
       filtersTried: number;
       unionSize: number;
+    }
+  | {
+      /**
+       * A leaf matched `SweepOptions.skipWindow` (9b: resume) and `search`
+       * was never called for it. See that option's doc comment for the
+       * exact, leaf-only matching semantics.
+       */
+      type: 'skipped';
+      query: Query;
+      depth: number;
+    }
+  | {
+      /**
+       * `search` threw `RejectedQueryError` for this leaf (9b): the walk
+       * catches this one itself, abandoning the leaf while its siblings
+       * still run, instead of ending the whole generator.
+       */
+      type: 'rejected';
+      query: Query;
+      depth: number;
+      message: string;
     };
 
 /**
@@ -185,6 +215,21 @@ export interface SweepOptions {
   cover?: CoverFn;
   /** Dedup state across the run. Defaults to an in-memory `Set`. */
   seen?: SeenSet;
+  /**
+   * Optional pre-search hook (9b: resume), checked **before** `search(query)`
+   * for a leaf. Typically `store.rebuildCoveredPredicate()`: a window
+   * already recorded as a final event in an earlier run is skipped outright,
+   * yielding a `skipped` event and never recursing into it.
+   *
+   * Matching is exact-leaf only (same caveat `rebuildCoveredPredicate`
+   * documents): it can only say yes for a query that was itself recorded as
+   * *final*. A capped ancestor of an already-covered subtree was never final
+   * (it was split), so it still gets re-requested on resume - one extra
+   * search per internal node on the covered path. Acceptable: reasoning
+   * about whole subtrees here would mean reimplementing `PartitionChain`'s
+   * splitting logic, for the cost of one search, not a detail fetch or download.
+   */
+  skipWindow?: (query: Query) => boolean;
 }
 
 /**
@@ -212,13 +257,27 @@ export interface SweepOptions {
  * the fuller comparison against a callback-based emitter.
  */
 export async function* sweep(options: SweepOptions): AsyncGenerator<SweepEvent> {
-  const { search, chain, cover } = options;
+  const { search, chain, cover, skipWindow } = options;
   const seen: SeenSet = options.seen ?? new Set<string>();
 
   yield* walk({ from: options.from, to: options.to }, 0);
 
   async function* walk(query: Query, depth: number): AsyncGenerator<SweepEvent> {
-    const response = await search(query);
+    if (skipWindow?.(query) === true) {
+      yield { type: 'skipped', query, depth };
+      return;
+    }
+
+    let response: SearchResponse;
+    try {
+      response = await search(query);
+    } catch (error) {
+      if (error instanceof RejectedQueryError) {
+        yield { type: 'rejected', query, depth, message: error.message };
+        return;
+      }
+      throw error;
+    }
 
     if (!response.capped) {
       // Final event: dedupe against, and register into, the run-wide seen set.

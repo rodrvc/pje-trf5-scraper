@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { RejectedQueryError } from '../src/domain/errors.js';
 import { DateRangeSplit, JudicialClassSplit, PartitionChain } from '../src/pipeline/partition.js';
 import { sweep, type CoverFn, type SweepEvent } from '../src/pipeline/sweep.js';
 import type { JudicialClass, Query, SearchResponse, SearchResultRow } from '../src/domain/types.js';
@@ -209,7 +210,8 @@ describe('sweep', () => {
     expect(cappedEvent?.rows.map((r) => r.number).sort()).toEqual(['shared-a', 'shared-b']);
 
     const class202Event = events.find(
-      (e) => e.type === 'window' && e.query.judicialClassId === '202',
+      (e): e is Extract<SweepEvent, { type: 'window' }> =>
+        e.type === 'window' && e.query.judicialClassId === '202',
     );
     // The child's final event still carries both rows: they were not marked
     // "seen" by the parent's (non-final) capped event.
@@ -312,5 +314,61 @@ describe('sweep', () => {
     // 'a' was already registered as seen by the '202' window's final event,
     // so the cover event must not repeat it - only the new row survives.
     expect(coveredEvent?.rows.map((r) => r.number)).toEqual(['brand-new']);
+  });
+
+  it('skips a window matching skipWindow without ever calling search for it', async () => {
+    const calls: Query[] = [];
+    const search = async (query: Query): Promise<SearchResponse> => {
+      calls.push(query);
+      if (query.from === query.to) return response([row(`case-${query.from}`)], false);
+      return response([row('case-range')], true);
+    };
+
+    // Pretend an earlier run already recorded 2025-03-12 as a final window.
+    const skipWindow = (query: Query): boolean =>
+      query.from === '2025-03-12' && query.to === '2025-03-12';
+
+    const events = await collect(
+      sweep({ from: '2025-03-11', to: '2025-03-12', search, chain: makeChain(), skipWindow }),
+    );
+
+    // search was never called for the skipped leaf.
+    expect(calls).not.toContainEqual({ from: '2025-03-12', to: '2025-03-12' });
+
+    const skipped = events.filter((e) => e.type === 'skipped');
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]).toMatchObject({ query: { from: '2025-03-12', to: '2025-03-12' } });
+
+    // The other day still ran normally.
+    const windows = events.filter((e) => e.type === 'window');
+    expect(windows).toHaveLength(1);
+    expect(windows[0]?.query).toEqual({ from: '2025-03-11', to: '2025-03-11' });
+  });
+
+  it('logs a rejected leaf and continues with its siblings instead of ending the walk', async () => {
+    const search = async (query: Query): Promise<SearchResponse> => {
+      if (query.from === '2025-03-12') {
+        throw new RejectedQueryError('rejected', 'server message');
+      }
+      if (query.from === query.to) return response([row(`case-${query.from}`)], false);
+      return response([row('case-range')], true);
+    };
+
+    const events = await collect(
+      sweep({ from: '2025-03-11', to: '2025-03-12', search, chain: makeChain() }),
+    );
+
+    const rejected = events.filter((e) => e.type === 'rejected');
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toMatchObject({
+      query: { from: '2025-03-12', to: '2025-03-12' },
+      message: 'rejected',
+    });
+
+    // The sibling leaf (2025-03-11) still ran to completion, proving the
+    // walk did not end when 2025-03-12 was rejected.
+    const windows = events.filter((e) => e.type === 'window');
+    expect(windows).toHaveLength(1);
+    expect(windows[0]?.query).toEqual({ from: '2025-03-11', to: '2025-03-11' });
   });
 });
