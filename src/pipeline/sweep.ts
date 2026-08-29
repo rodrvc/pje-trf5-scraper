@@ -43,7 +43,7 @@ export interface SeenSet {
 /**
  * One step of the walk: either a completed window, or a warning about one.
  *
- * Three variants are **final**: `window`, `unsplittable`, `covered`, and
+ * Four variants are **final**: `window`, `unsplittable`, `covered`, and
  * `abandoned` (the last two only ever come from an injected `cover`). Their
  * `rows` are deduplicated against every other final event in the run and are
  * the actual answer for that slice of the query space.
@@ -122,6 +122,31 @@ export type SweepEvent =
     };
 
 /**
+ * What a cover reports for one leaf, minus the fields the walk itself owns.
+ *
+ * A cover has no notion of `depth` - it is not part of the recursive
+ * `PartitionChain` tree, it is only ever invoked once per leaf - and `query`
+ * is simply the `leaf` the walk already passed in. Requiring the cover to
+ * echo both back was redundant and, worse, gave it a chance to get them
+ * wrong (see the architecture-review nit this type resolves: the walk, not
+ * the cover, is the single owner of `depth` and `query` for every event kind).
+ */
+export type CoverEvent =
+  | {
+      type: 'covered';
+      rows: SearchResultRow[];
+      filtersTried: number;
+      unionSize: number;
+      plateaued: true;
+    }
+  | {
+      type: 'abandoned';
+      rows: SearchResultRow[];
+      filtersTried: number;
+      unionSize: number;
+    };
+
+/**
  * A cover hook: the seam ISSUE-4b plugs into, invoked on a leaf that
  * saturated and that the `PartitionChain` cannot narrow any further.
  *
@@ -134,13 +159,17 @@ export type SweepEvent =
  * that request.
  *
  * Must end with exactly one `covered` or `abandoned` event; the walk does not
- * yield an `unsplittable` for a leaf handed to a cover.
+ * yield an `unsplittable` for a leaf handed to a cover. The cover yields
+ * `CoverEvent`s, not full `SweepEvent`s: it does not know its own `depth` in
+ * the walk and `query` is just the `leaf` it was handed, so the call site
+ * (`dedupeCoverEvent`) stamps both on before the event reaches the consumer -
+ * see that function's comment.
  */
 export type CoverFn = (
   leaf: Query,
   first: SearchResponse,
   search: SearchFn,
-) => AsyncGenerator<SweepEvent>;
+) => AsyncGenerator<CoverEvent>;
 
 export interface SweepOptions {
   /** Root date range to walk, ISO 8601. */
@@ -201,11 +230,12 @@ export async function* sweep(options: SweepOptions): AsyncGenerator<SweepEvent> 
     if (strategy === undefined) {
       if (cover !== undefined) {
         // The cover owns its own probing and union-growth logic; the walk's
-        // only responsibility is to apply the same run-wide dedup to
+        // job is to stamp `depth`/`query` (the cover has no notion of either -
+        // see CoverEvent's doc comment) and apply the same run-wide dedup to
         // whatever final rows it reports, exactly as for every other final
         // event kind.
         for await (const event of cover(query, response, search)) {
-          yield dedupeCoverEvent(event);
+          yield toSweepEvent(event, query, depth);
         }
         return;
       }
@@ -244,12 +274,14 @@ export async function* sweep(options: SweepOptions): AsyncGenerator<SweepEvent> 
     }
   }
 
-  /** Deduplicates a cover's final rows the same way every other final event is. */
-  function dedupeCoverEvent(event: SweepEvent): SweepEvent {
-    if (event.type === 'covered' || event.type === 'abandoned') {
-      return { ...event, rows: deduplicate(event.rows, seen) };
-    }
-    return event;
+  /**
+   * Turns a `CoverEvent` into a full `SweepEvent`: stamps `depth` and `query`
+   * (the walk is the single owner of both - the cover neither tracks its own
+   * recursion depth nor needs to echo back the leaf it was handed) and
+   * deduplicates the rows the same way every other final event is.
+   */
+  function toSweepEvent(event: CoverEvent, query: Query, depth: number): SweepEvent {
+    return { ...event, query, depth, rows: deduplicate(event.rows, seen) };
   }
 }
 

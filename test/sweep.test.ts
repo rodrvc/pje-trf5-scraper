@@ -246,12 +246,12 @@ describe('sweep', () => {
     // immediately reports the leaf covered with a fixed union, to prove the
     // seam is wired correctly rather than to exercise real party-token logic
     // (which belongs to ISSUE-4b's own tests).
-    const fakeCover: CoverFn = async function* (leaf, _first, _search) {
+    const fakeCover: CoverFn = async function* (_leaf, _first, _search) {
+      // Deliberately omits `query`/`depth`: the cover has no notion of
+      // either (see CoverEvent's doc comment) - the walk stamps them.
       yield {
         type: 'covered',
-        query: leaf,
         rows: [row('found-by-cover')],
-        depth: 99,
         filtersTried: 3,
         unionSize: 1,
         plateaued: true,
@@ -271,17 +271,23 @@ describe('sweep', () => {
     const covered = events.filter((e) => e.type === 'covered');
     expect(covered).toHaveLength(catalog.length);
     expect(covered[0]).toMatchObject({ filtersTried: 3, unionSize: 1, plateaued: true });
+    // The walk stamps `depth` and `query`, not the cover: each class leaf's
+    // cover event carries the depth of that leaf (root day=0, class split=1)
+    // and the query it actually covered, not a value the cover made up.
+    for (const event of covered) {
+      expect(event.depth).toBe(1);
+      expect(event.query.judicialClassId).toBeDefined();
+    }
   });
 
   it('deduplicates a cover event rows against the run-wide seen set, like any other final event', async () => {
-    const fakeCover: CoverFn = async function* (leaf, _first, _search) {
+    const fakeCover: CoverFn = async function* (_leaf, _first, _search) {
       // Deliberately returns a row the parent's capped event already showed
-      // (informationally) plus a genuinely new one.
+      // (informationally) plus a genuinely new one. `query`/`depth` are
+      // omitted here too - the walk stamps them, not the cover.
       yield {
         type: 'covered',
-        query: leaf,
         rows: [row('a'), row('brand-new')],
-        depth: 99,
         filtersTried: 1,
         unionSize: 2,
         plateaued: true,
