@@ -63,8 +63,9 @@ one, splitting along three dimensions in cascade:
 
 The second dimension proved essential: probing March 2025, **6 out of 13 days hit the
 cap on their own** (`docs/probe-pagination.sh` reproduces the measurement). The third
-dimension is different in kind from the first two: date and class splits are disjoint partitions whose completeness is proved by construction
-(recursion stops when no half saturates), while "Nome da parte" is a `LIKE %token%`
+dimension is different in kind from the first two: date and class splits are disjoint
+partitions whose completeness is proved by construction (recursion stops when no half
+saturates), while "Nome da parte" is a `LIKE %token%`
 substring match, so filters *overlap* and the resulting subsets are a **cover, not a
 partition**. Completeness there is measured, not proved: a leaf is accepted once the
 union of cases found across filters stops growing for several filters in a row, and a
