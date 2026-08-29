@@ -200,9 +200,31 @@ module comment was corrected to "a torn line is possible and handled," since
 that guarantee is for pipes, not regular files; `windowKey` documents why
 `judicialClassName` is excluded from the key.
 
+**A second review pass on this same fix found a real bug in it**: the
+scan-window loop in `truncateTornTail` started `windowSize` at `4096` with
+guard `windowSize < size`, so for any file no larger than 4096 bytes the
+loop body never ran, `lastNewline` stayed `-1`, and the "no newline found
+anywhere" fallback truncated the file to **empty** - deleting every valid
+record on disk along with the torn tail, for the overwhelmingly common case
+of a small log. Fixed by starting `windowSize` at `0` (widening to 4096 on
+the first iteration), guaranteeing at least one pass for any non-empty
+file. Pinned by two tests folded into the existing torn-tail describe
+block in `ndjson-log.test.ts`: a small file with an earlier valid record
+before the torn tail, and a first record over 8 KB (forcing the loop to
+widen past its first doubling) before the torn tail - both verified against
+the pre-fix code to fail without it.
+
+The façade's usage sketch (`store.ts`) also had a related gap: it drained
+`listPendingRows()` unconditionally, but `recordFinalEvent` enqueues a
+window's rows even for cases a resumed run already has (a re-listed,
+already-covered window's rows are indistinguishable from new ones once
+enqueued) - so every resume would re-fetch detail for every case any
+re-run window lists. The sketch now checks `caseIndex.has(row.number)`
+first and just dequeues (no re-fetch) when it does.
+
 ### Verification
 
-`npm test`: **211 tests green** (179 baseline + 35 net new across
+`npm test`: **213 tests green** (179 baseline + 37 net new across
 `ndjson-log.test.ts`, `case-store.test.ts`, `pending-store.test.ts`,
 `sweep-progress-store.test.ts`, `failed-document-store.test.ts`,
 `persistence-store.test.ts`, `failure-ledger.test.ts`,
