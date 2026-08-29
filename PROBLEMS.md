@@ -302,6 +302,41 @@ So `ca=` is a stable case identifier, not a conversation token like the PDF `cid
 (problem 7). **It can be persisted for resuming**: picking up a run does not require
 re-running the search to reach an already-listed case.
 
+**Status:** resolved — implemented in ISSUE-5 (`src/pje/detail.ts`,
+`src/domain/parse-detail.ts`).
+
+### A single-page table's scroller markup is not always the same shape
+
+Confirmed while implementing ISSUE-5: parties tables always render a
+`<div class="rich-datascr">` for their scroller, hidden and with no page links
+when there is only one page. Movements, in every case sampled, rendered **no
+scroller registration at all** when there was only one page — not even a
+hidden one. Both must be read as "one page, nothing to walk", but the second
+case has no scroller id to name at all, unlike the first.
+
+### `nomeArqProcDocBin` is percent-encoded in latin-1, not UTF-8
+
+Found while parsing document download links for ISSUE-5. The rest of the site
+decides UTF-8 vs. latin-1 from the bytes per request (problem 8), but this one
+query-string parameter is an exception within an otherwise-UTF-8 AJAX/GET
+response: `Despacho+Inspe%E7%E3o+-+1141+-+INSPE%C7%C3O` only decodes correctly
+as latin-1 (`%E7` = ç, `%C7` = Ç). Decoding it as UTF-8 (what `URLSearchParams`
+does) silently corrupts every accented file name. Handled explicitly in
+`decodeLatin1QueryValue()`, reading the raw query string instead of relying on
+`URLSearchParams` for that one field.
+
+### A server error can look exactly like a sealed case
+
+While sampling live cases for a segredo de justiça example (17 candidates,
+none sealed), one (`0804011-36.2025.4.05.8100`) returned a genuine
+PostgreSQL error page — `cannot execute UPDATE in a read-only transaction`,
+raised from `ProcessoDocumentoBinHome` while rendering the document panel —
+instead of the detail view. It is a real server bug, not a sealed case, but it
+shares the one signal `isSealed()` uses (no "Dados do Processo" heading), so it
+is read as sealed too. Both are treated the same way on purpose — "detail
+unavailable, not an error" — but it means that flag does not distinguish the
+two causes.
+
 ---
 
 ## 7. PDFs are served through single-use links

@@ -16,7 +16,7 @@ Board status:
 | [ISSUE-3](ISSUE-3-search.md) | Case search | done |
 | [ISSUE-4](ISSUE-4-date-sweep.md) | Date-window sweep | done |
 | [ISSUE-4b](ISSUE-4b-party-sweep.md) | Party-token sweep | done |
-| [ISSUE-5](ISSUE-5-case-detail.md) | Case detail | todo |
+| [ISSUE-5](ISSUE-5-case-detail.md) | Case detail | done |
 | [ISSUE-6](ISSUE-6-pdfs.md) | PDF downloads | todo |
 | [ISSUE-7](ISSUE-7-persistence.md) | Persistence and resuming | todo |
 | [ISSUE-8](ISSUE-8-cli-readme.md) | CLI, logging and README | todo |
