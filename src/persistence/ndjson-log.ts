@@ -88,10 +88,18 @@ async function truncateTornTail(path: string): Promise<void> {
     // window, doubling it until found or the whole file has been scanned.
     // A torn write is always short relative to a log's total size (at most
     // one record), so this loop runs once in practice.
-    let windowSize = 4096;
+    //
+    // windowSize starts at 0 (not 4096): the loop condition is
+    // `windowSize < size`, so for any file no larger than the starting
+    // window that condition would be false on the very first check, the
+    // body would never run, lastNewline would stay -1, and truncateAt below
+    // would become 0 - deleting every valid record on disk along with the
+    // torn tail. Starting at 0 guarantees at least one iteration runs for
+    // any non-empty file, growing to 4096 on that first pass.
+    let windowSize = 0;
     let lastNewline = -1;
     while (lastNewline === -1 && windowSize < size) {
-      windowSize = Math.min(windowSize * 2, size);
+      windowSize = Math.min(windowSize === 0 ? 4096 : windowSize * 2, size);
       const window = Buffer.alloc(windowSize);
       await handle.read(window, 0, windowSize, size - windowSize);
       const found = window.lastIndexOf(0x0a);

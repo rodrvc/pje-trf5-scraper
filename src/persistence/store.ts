@@ -48,6 +48,14 @@
  *     }
  *
  *     for (const row of await store.listPendingRows()) {
+ *       // recordFinalEvent enqueues a window's rows unconditionally (see
+ *       // above) - it has no way to know a case was already completed by
+ *       // an earlier run, so a resumed sweep that re-lists an
+ *       // already-covered window (harmless - see rebuildCoveredPredicate)
+ *       // re-enqueues rows for cases this run may already have. Skip those
+ *       // here, or every resume re-fetches detail for every case any
+ *       // re-run window lists:
+ *       if (caseIndex.has(row.number)) { await store.dequeueRow(row.number); continue; }
  *       // fetch detail, then, once downloads for it are done (or skipped):
  *       await store.completeRow(legalCase);
  *       // a detail fetch that throws instead:
