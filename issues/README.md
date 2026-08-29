@@ -20,5 +20,5 @@ Board status:
 | [ISSUE-6](ISSUE-6-pdfs.md) | PDF downloads | done |
 | [ISSUE-7](ISSUE-7-persistence.md) | Persistence and resuming | done |
 | [ISSUE-8](ISSUE-8-cli-readme.md) | CLI, logging and README | todo |
-| [ISSUE-9](ISSUE-9-orchestrator.md) | Sweep orchestrator | todo |
+| [ISSUE-9](ISSUE-9-orchestrator.md) | Sweep orchestrator | done |
 | [ISSUE-10](ISSUE-10-tests.md) | Test suite with fixtures | todo |

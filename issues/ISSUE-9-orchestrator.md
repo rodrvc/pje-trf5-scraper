@@ -1,7 +1,7 @@
 ---
 id: ISSUE-9
 title: Sweep orchestrator
-status: todo
+status: done
 ---
 
 ## Goal
@@ -214,23 +214,21 @@ leaf must be re-attempted by a later run, not skipped forever.
 
 ## Resolution (part 3 of 3: budgets and the demo run)
 
-Status stays `todo`: part 2 (resume/retry, 9b) is still an open PR
-(`orchestrator-resume`, #16) at the time this lands, not yet merged into
-`main` - closing the issue here would be premature. Flip it once #16 merges.
-
 Added `ScraperOptions.limits?: { maxRequests?: number; maxCases?: number }`
-to `src/pipeline/orchestrator.ts`. Enforcement is a single `budgetExceeded`
-helper, checked at exactly two points: before every `generator.next()` in
-`runSweep` (so a hit means no further search, ever) and before every row's
-detail fetch, in both `runSweep`'s per-window loop and `drainPendingRows`.
-Hitting a budget sets `stoppedBy` and calls `generator.return()` to close the
-sweep's async generator cleanly - no dangling `walk` frames, no further
-searches. A stop is **not** an abort: `run()` still resolves with the
-`RunSummary` (now carrying `stoppedBy: 'maxRequests' | 'maxCases' | undefined`),
-never throws `RunAbortedError` for it. Whatever case was already mid-flight
-when the budget was checked still finishes its downloads and its
-`completeRow` - the budget only ever gates *starting* new work, matching the
-brief: "downloads of the current case still complete".
+to `src/pipeline/orchestrator.ts`. Enforcement is gated at three
+granularities: before every `generator.next()` in `runSweep` (so a hit means
+no further search, ever), before every row's detail fetch (in `runSweep`'s
+per-window loop, `drainPendingRows`, and both of `retryFailed`'s loops), and
+before every document download (inside `downloadDocuments` itself - see the
+architecture-review fix below). Hitting a budget sets `stoppedBy` and calls
+`generator.return()` to close the sweep's async generator cleanly - no
+dangling `walk` frames, no further searches. A stop is **not** an abort:
+`run()`/`retryFailed()` still resolve with the `RunSummary` (now carrying
+`stoppedBy: 'maxRequests' | 'maxCases' | undefined`), never throwing
+`RunAbortedError` for it. Whatever case was already mid-flight when the
+budget was checked still finishes its downloads and its `completeRow` -
+the budget only ever gates *starting* new work, matching the brief:
+"downloads of the current case still complete".
 
 **Class-split sanity check** (ISSUE-4's resolution asks ISSUE-9 to run this):
 a small `ClassSplitCheck` class observes the same `SweepEvent` stream
@@ -239,30 +237,50 @@ a small `ClassSplitCheck` class observes the same `SweepEvent` stream
 `depth === cappedDepth + 1` adds to it; the subtree closes (logging
 `classSplitCheck { day, childrenRows, ok: childrenRows >= 30 }` through the
 `LogSink`) at the next event with `depth <= cappedDepth`, or when the sweep
-ends (`finally` block). One helper, one parameterized test
-(`test/orchestrator.test.ts`, an `it.each` over `[20, 15, true]` and
-`[5, 4, false]`) using a real `JudicialClassSplit` with a two-class fake
-catalog.
+ends (`finally` block). It is a **fresh-run diagnostic**: a non-final child
+(a `skipped`/`rejected` leaf, 9b) or a run interrupted by the budget both
+suppress the verdict (`ok: undefined, incomplete: true`) rather than report
+a partial sum as a false catalog alarm.
 
 **`scripts/smoke-orchestrator.ts`** (`npm run smoke:orchestrator`): wires the
 real `HttpClient`/`JsfSession`/`PjeSearch`/`PjeDetail`/`PjeDownloader`/
 `PersistenceStore` stack, fetches the real class catalog, and runs one
-bounded `Scraper.run()`. Flags: `--from`/`--to` (default yesterday, UTC),
-`--max-requests` (default 40), `--max-cases` (default 3), `--delay-ms`
-(default 1500). Prints the `RunSummary` as one readable line per field.
-`data/`/`pdfs/` are gitignored (verified - both already listed).
+bounded `Scraper.run()` (or `retryFailed()` with `--retry-failed`). Flags:
+`--from`/`--to` (default yesterday, UTC), `--max-requests` (default 40),
+`--max-cases` (default 3), `--delay-ms` (default 1500), `--retry-failed`.
+Prints the `RunSummary` as one readable line per field; sweep log lines
+print `type`/`query`/`rows.length`, not the full row payload. `data/`/`pdfs/`
+are gitignored (verified - both already listed).
 
-**Tests**: 5 new in `test/orchestrator.test.ts` (222 total, up from 217):
-stops at `maxRequests` with `stoppedBy` set and no further search after the
-stop (an always-splittable fake chain proves the budget, not an exhausted
-chain, ends the walk); stops at `maxCases` after finishing the in-flight
-case's downloads and row completion; one test covering both "no limits ->
-`stoppedBy` undefined" and "a budget stop resolves normally, never throws";
-and the class-split check (`it.each`, 2 cases). `npm test`: 222/222 green.
+**Architecture-review fix on `maxRequests`'s bound**: the first version of
+this budget only checked before a row's detail fetch, so a case with many
+documents could still run the request count well past the configured limit
+(a 20-document case landing near +20, not the intended +1). Fixed by adding
+the same gate inside `downloadDocuments` itself, before every document
+attempt - `maxRequests`'s overshoot is now bounded to at most one request,
+the one already in flight when a check runs (the one documented exception:
+a `cover` leaf, ISSUE-4b, is one sweep step that can still cost up to ~15 of
+its own searches before yielding, so a stop can land after a whole cover
+pass there). `maxCases` counts only successful detail fetches. When the
+per-document gate fires mid-case, `completeRow` (or, for `retryFailed()`,
+`recordCaseSuccess`) is skipped and the case stays pending/retryable:
+persistence was already built to make that safe (see the crash-safety note
+above) - a later run re-attempts only the documents that never got tried,
+not the ones already downloaded.
+
+**Tests**: `test/orchestrator.test.ts` grew from 10 (part 1) to 24 across
+parts 2 and 3: stops at `maxRequests` with `stoppedBy` set and no further
+search after the stop; stops at `maxCases` after finishing the in-flight
+case's downloads; no-limits vs. a budget stop resolving normally, never
+throwing; the class-split check parameterized over `ok: true`/`ok: false`;
+the per-document gate leaving a row pending with `completeRow` never called;
+a budget stop and a skipped child both suppressing `classSplitCheck`'s
+verdict; and `retryFailed()`'s own budget gate stopping before its second
+failed case. `npm test`: 234/234 green (full suite, including parts 1/2).
 `npm run typecheck`: clean.
 
 **Live smoke**: `2025-03-05..2025-03-05`, `--max-cases=3 --max-requests=40`,
-`delayMs: 1500`, against the real TRF5 site.
+`delayMs: 1500`, against the real TRF5 site, run after the per-document fix.
 
 | Metric | Value |
 |---|---|
@@ -270,30 +288,25 @@ and the class-split check (`it.each`, 2 cases). `npm test`: 222/222 green.
 | Cases listed | 10 |
 | Cases detailed | 3 |
 | Cases failed | 0 |
-| Documents downloaded | 24 (595,707 bytes total) |
+| Documents downloaded | 22 (554,488 bytes total) |
 | Documents failed | 0 |
-| Requests | 42 |
+| Requests | 40 |
 | 429 retries | 0 |
 | Stopped by | `maxRequests` |
+| Pending rows | 8 |
 
-The day did not saturate (10 rows, uncapped), so no class-split subtree was
-exercised in this particular live run - the `classSplitCheck` logic is
-covered by the scripted unit tests instead, which exercise the `ok: true`,
-`ok: false`, and interrupted (`ok: undefined, incomplete: true`) branches
-directly.
-
-**Architecture-review fix on `maxRequests`'s bound**: the first version of
-this budget only checked before a row's detail fetch, so a case with many
-documents could still run the request count well past the configured limit
-(a 20-document case landing near +20, not the intended +1). Fixed by adding
-the same `budgetExceeded`-style check inside `downloadDocuments` itself,
-before every document attempt - `maxRequests`'s overshoot is now bounded to
-at most one request, the one already in flight when a check runs (the one
-documented exception: a `cover` leaf, ISSUE-4b, is one sweep step that can
-still cost up to ~15 of its own searches before yielding, so a stop can land
-after a whole cover pass there). When the per-document gate fires mid-case,
-`completeRow` is skipped and the case stays `appendCase`d (still pending):
-persistence was already built to make that safe (see the crash-safety note
-above) - a resumed run (9b) re-attempts only the documents that never got
-tried, not the ones already downloaded. `data/`/`pdfs/` were deleted after
+`requests: 40` lands exactly at the configured budget (not the +2 overshoot
+an earlier run of this same range showed before the per-document fix),
+confirming the bound: the third case's downloads stopped 2 documents short
+of complete, leaving its row pending rather than dequeued - a later run
+picks up only those two, not a re-download of the twenty-two already on
+disk. The day did not saturate (10 rows, uncapped), so no class-split
+subtree was exercised live - that logic is covered by the scripted unit
+tests instead, which exercise the `ok: true`, `ok: false`, and suppressed
+(`ok: undefined, incomplete: true`, both the interrupted-run and
+skipped-child cases) branches directly. `data/`/`pdfs/` were deleted after
 the run.
+
+**Closing**: part 2 (resume/retry, #16) merged into `main` before this PR's
+final rebase, so `status` flips to `done` here - all three parts (the loop,
+resume/retry, and budgets/the demo run) are now closed.
