@@ -119,8 +119,11 @@ split that day by judicial class.
 ### Cap detection
 
 Across 14 probes, `rows == 30` always came with the warning, and `< 30` never did.
-Even so the defensive condition **`rows >= 30 || warning present`** is used: if the
-cap ever arrived without a warning, the alternative is losing cases silently.
+The defensive condition **`rows >= 30 || warning present`** is used regardless:
+warning present means truncated for certain; exactly 30 rows with no warning means
+possibly complete (see "The warning means more-than-30, not exactly-30" below) but
+is still treated as capped, a cheap false positive traded against the alternative
+of losing cases silently if the warning ever failed to appear on a real cap.
 
 ### Approaches ruled out
 
@@ -190,17 +193,6 @@ rather than by a fixed number of probes. Note this axis is a **cover, not a
 partition**: the subsets overlap, so termination comes from the union ceasing to grow,
 not from disjointness. Deduplication by CNJ (already required) absorbs the overlap.
 
-### Correction: the cap warning was never observed to be absent
-
-An earlier note recorded a leaf returning 30 rows *without* the truncation warning.
-**That could not be reproduced.** Re-probed across six saturating leaves
-(2025-03-11, 12, 13, 14, 18, 19, all with class 202): every one returned 30 rows
-**with** the warning present.
-
-The defensive condition `rows >= 30 || warning present` stays, because a silent cap
-would create exactly the gap it guards against — but it is a precaution, not a
-response to observed behaviour.
-
 ### Correction: the judicial-class filter needs both the id AND the display name
 
 While re-measuring for ISSUE-4b, a raw curl probe sending only
@@ -241,23 +233,36 @@ the wrong numbers. Re-confirmed live during ISSUE-4b (see its Resolution for
 the full digraph/trigram measurement built on this same leaf, reaching 46
 unique cases past the 30-row cap).
 
-### Note: a saturated leaf can show exactly 30 rows with no warning text
+### The warning means more-than-30, not exactly-30
 
-2025-03-12 + class 202 (table above) hits the 30-row cap **without** the
-"muitos processos" warning — contradicting the earlier "cap warning was never
-observed to be absent" correction, and confirmed independently across
-multiple live probes (both raw curl and `PjeSearch`). The likely explanation:
-the warning text appears only when *more than* 30 rows would otherwise be
-returned, so a leaf whose true total is exactly 30 hits the count cap without
-crossing into "too many to show" territory server-side — 2025-03-12 with no
-class filter, by contrast, does have more than 30 and shows the warning as
-expected. This is a **conservative false positive** for the defensive rule
-`rows >= 30 || warning present`: a leaf like this gets treated as saturated
-and handed to `JudicialClassSplit`/`PartyTokenSweep` even when it has nothing
-further to give, costing a few wasted requests (the party-token cover
-plateaus almost immediately, `unionSize` barely moving past the seed), but it
-never drops a case. The rule stays exactly as specified — undercounting a
-real cap would be the opposite, and much worse, mistake.
+An earlier probe pass claimed the truncation warning is never absent from a
+30-row response: re-probing six leaves (2025-03-11, 12, 13, 14, 18, 19, all
+day-level, no class filter) always returned 30 rows **with** the warning
+present. That held because every one of those probes was day-level, and a
+day always has well over 30 cases behind it — those leaves were never at
+exactly 30.
+
+With the class filter actually applied, a different case shows up:
+2025-03-12 + class 202 hits exactly 30 rows **without** the warning, confirmed
+independently across multiple live probes (both raw curl and `PjeSearch`,
+see the class-filter correction above for the full table). The two
+observations are not in tension once read together: the warning text fires
+only when *more than* 30 rows would otherwise be returned, not whenever the
+30-row limit is hit. A leaf whose true total is exactly 30 saturates the
+display limit without ever crossing into "too many to show" territory
+server-side, so no warning appears — it is not "saturated" in the sense the
+rest of this section uses the word (there is nothing beyond the 30 shown),
+just exactly at the boundary.
+
+This means `rows >= 30 || warning present` has two distinct readings:
+warning present ⇒ truncated for sure, more cases exist beyond the 30 shown;
+30 rows with no warning ⇒ possibly complete, but still treated as capped by
+the rule. That is a cheap false positive: a leaf like this gets handed to
+`JudicialClassSplit`/`PartyTokenSweep` for nothing, costing a few wasted
+requests (the party-token cover plateaus almost immediately, `unionSize`
+barely moving past the seed), but it never drops a case. The rule stays
+exactly as specified — undercounting a real cap would be the opposite, and
+much worse, mistake.
 
 ---
 
