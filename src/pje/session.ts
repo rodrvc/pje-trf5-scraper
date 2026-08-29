@@ -10,7 +10,7 @@
  * different one from the search page, and mixing them breaks navigation.
  */
 
-import type { HttpClient, TextResponse } from '../http/client.js';
+import type { BinaryResponse, HttpClient, TextResponse } from '../http/client.js';
 import { ParseError, SessionExpiredError } from '../domain/errors.js';
 
 export const BASE_URL = 'https://pjett.trf5.jus.br/pjeconsulta';
@@ -116,6 +116,29 @@ export class JsfSession {
     await this.http.resetSession();
     this.viewStates.clear();
     await this.open(view, query);
+  }
+
+  /**
+   * GET returning raw bytes, against a view's URL.
+   *
+   * Used for PDF downloads (ISSUE-6): the document link is a GET to the
+   * detail view itself, carrying the download identifiers as query params,
+   * which 302-redirects to a session-bound `download.seam?cid=<N>`. Routed
+   * through the session (not `HttpClient` directly) so a caller can never
+   * pair a download with a different client than the one holding the live
+   * cookie jar - a mismatched pair would mean the redirect's `cid` is bound
+   * to a session the request is not actually carrying, and PJe answers that
+   * with a 404 rather than anything diagnosable.
+   */
+  async getBinary(
+    view: View,
+    query?: string,
+    headers?: Record<string, string>,
+  ): Promise<BinaryResponse> {
+    return this.http.getBinary(this.url(view, query), {
+      Referer: this.url(view),
+      ...headers,
+    });
   }
 
   viewStateFor(view: View): string | undefined {
