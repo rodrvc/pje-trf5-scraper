@@ -278,9 +278,22 @@ and the class-split check (`it.each`, 2 cases). `npm test`: 222/222 green.
 
 The day did not saturate (10 rows, uncapped), so no class-split subtree was
 exercised in this particular live run - the `classSplitCheck` logic is
-covered by the scripted unit test instead, which exercises both the `ok:
-true` and `ok: false` branches directly. The stop landed cleanly at 42
-requests (just past the 40 budget: the check runs before starting a row's
-detail fetch, not mid-download, so the third case's own downloads - already
-in flight - still completed, exactly as designed) with 7 rows left pending
-for a resumed run (9b) to pick up. `data/`/`pdfs/` were deleted after the run.
+covered by the scripted unit tests instead, which exercise the `ok: true`,
+`ok: false`, and interrupted (`ok: undefined, incomplete: true`) branches
+directly.
+
+**Architecture-review fix on `maxRequests`'s bound**: the first version of
+this budget only checked before a row's detail fetch, so a case with many
+documents could still run the request count well past the configured limit
+(a 20-document case landing near +20, not the intended +1). Fixed by adding
+the same `budgetExceeded`-style check inside `downloadDocuments` itself,
+before every document attempt - `maxRequests`'s overshoot is now bounded to
+at most one request, the one already in flight when a check runs (the one
+documented exception: a `cover` leaf, ISSUE-4b, is one sweep step that can
+still cost up to ~15 of its own searches before yielding, so a stop can land
+after a whole cover pass there). When the per-document gate fires mid-case,
+`completeRow` is skipped and the case stays `appendCase`d (still pending):
+persistence was already built to make that safe (see the crash-safety note
+above) - a resumed run (9b) re-attempts only the documents that never got
+tried, not the ones already downloaded. `data/`/`pdfs/` were deleted after
+the run.
