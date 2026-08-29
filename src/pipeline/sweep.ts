@@ -1,36 +1,62 @@
 /**
  * The date-window sweep: walks the whole corpus around the 30-result cap.
  *
- * PROBLEMS.md §5. A query that saturates (`capped: true`) is not a result, it
- * is a signal to narrow further. This walks the query space depth-first,
- * narrowing with the `PartitionChain` (ISSUE-4's `DateRangeSplit` and
- * `JudicialClassSplit`) whenever a window caps, and emitting the rows of every
- * window that does not.
+ * PROBLEMS.md §5. A query that saturates is not a result, it is a signal to
+ * narrow further. This walks the query space depth-first, narrowing with the
+ * `PartitionChain` (ISSUE-4's `DateRangeSplit` and `JudicialClassSplit`)
+ * whenever a window caps, and emitting a `SweepEvent` for every window
+ * covered - a final one for a window that did not saturate, an informational
+ * one for a window that was narrowed further, and (via the optional `cover`
+ * hook) an event for a leaf reached by ISSUE-4b's cover instead.
  *
  * Kept pure with respect to I/O: `search` is injected, so the whole walk is
  * testable with a scripted fake and no network (see test/sweep.test.ts).
+ *
+ * Error policy: this generator does not catch anything from `search`. A throw
+ * propagates out of the `for await` loop the caller is driving, aborting the
+ * walk; every event already yielded still stands (a `for await` consumer has
+ * already seen and can keep them). Deciding whether to retry, skip the query,
+ * or give up the whole run is the runner's job (ISSUE-7), not this function's.
  */
 
 import type { Query, SearchResponse, SearchResultRow } from '../domain/types.js';
 import type { PartitionChain } from './partition.js';
 
+/** Signature every search function passed to the sweep (and the cover hook) must satisfy. */
+export type SearchFn = (query: Query) => Promise<SearchResponse>;
+
+/**
+ * A minimal seen-set contract, so dedup state can be backed by something other
+ * than an in-memory `Set` (e.g. a store ISSUE-7 persists to disk, letting a
+ * resumed run pick up the dedup state from where an earlier one left off).
+ *
+ * For the two partition strategies in this issue, which produce disjoint
+ * subqueries by construction, dedup is a no-op in practice - it only starts
+ * doing real work once a `cover` (ISSUE-4b) is plugged in, since a cover's
+ * subqueries can genuinely overlap.
+ */
+export interface SeenSet {
+  has(number: string): boolean;
+  add(number: string): void;
+}
+
 /**
  * One step of the walk: either a completed window, or a warning about one.
  *
- * Only two variants are **final**: `window` with `capped: false`, and
- * `unsplittable`. Their `rows` are deduplicated against every other final
- * event in the run and are the actual answer for that slice of the query
- * space.
+ * Three variants are **final**: `window`, `unsplittable`, `covered`, and
+ * `abandoned` (the last two only ever come from an injected `cover`). Their
+ * `rows` are deduplicated against every other final event in the run and are
+ * the actual answer for that slice of the query space.
  *
- * `window` with `capped: true` is **not final** - the issue's own framing is
- * that "a capped query is a signal to narrow, not a result". Its `rows` are
- * carried only for auditability (e.g. to show what the last row was before
- * the split, per PROBLEMS.md §5's ordering note) and are deliberately **not**
- * deduplicated against: the same cases will reappear in the children's final
- * events, and a consumer that materializes results must not treat a capped
- * window's rows as part of the output, or it will double-count and could
- * even (if it also marked them "seen") make the real, final sighting of those
- * cases look like a duplicate to be dropped.
+ * `capped` is **not final** - the issue's own framing is that "a capped query
+ * is a signal to narrow, not a result". Its `rows` are carried only for
+ * auditability (e.g. to show what the last row was before the split, per
+ * PROBLEMS.md §5's ordering note) and are deliberately **not** deduplicated
+ * against: the same cases will reappear in the children's final events, and a
+ * consumer that materializes results must not treat a capped window's rows as
+ * part of the output, or it will double-count and could even (if it also
+ * marked them "seen") make the real, final sighting of those cases look like
+ * a duplicate to be dropped.
  */
 export type SweepEvent =
   | {
@@ -38,42 +64,98 @@ export type SweepEvent =
       type: 'window';
       query: Query;
       rows: SearchResultRow[];
-      capped: false;
       depth: number;
     }
   | {
       /**
-       * A window saturated and was narrowed further. `rows` here are
-       * informational only (see the type-level doc above): the same cases are
-       * re-emitted, deduplicated, by this window's children.
+       * A window saturated and was narrowed further. `rows` are informational
+       * only (see the type-level doc above): the same cases are re-emitted,
+       * deduplicated, by this window's children.
        */
-      type: 'window';
+      type: 'capped';
       query: Query;
       rows: SearchResultRow[];
-      capped: true;
       depth: number;
       splitBy: string;
     }
   | {
       /**
        * A window saturated and **no strategy in the chain could split it
-       * further**. This is the hand-off point to ISSUE-4b: without this event,
-       * the sweep would either throw (stopping the whole run over one leaf) or
-       * silently drop the tail of that leaf, which is exactly the gap the
-       * cap-detection work in ISSUE-3/PROBLEMS.md §5 was meant to prevent.
+       * further** (and no `cover` was supplied, or it too gave up before
+       * plateau - see `abandoned`). This is the hand-off point to ISSUE-4b:
+       * without this event, the sweep would either throw (stopping the whole
+       * run over one leaf) or silently drop the tail of that leaf, which is
+       * exactly the gap the cap-detection work in ISSUE-3/PROBLEMS.md §5 was
+       * meant to prevent.
        */
       type: 'unsplittable';
       query: Query;
       rows: SearchResultRow[];
       depth: number;
+    }
+  | {
+      /**
+       * Emitted by an injected `cover` (ISSUE-4b's `PartyTokenSweep`) when its
+       * union of filters stopped growing: the leaf is complete, with evidence.
+       */
+      type: 'covered';
+      query: Query;
+      rows: SearchResultRow[];
+      depth: number;
+      filtersTried: number;
+      unionSize: number;
+      plateaued: true;
+    }
+  | {
+      /**
+       * Emitted by an injected `cover` when its request budget ran out before
+       * the union plateaued. Not final in the completeness sense - the leaf is
+       * known-incomplete - but still a terminal event for the walk: nothing
+       * else will be tried on it.
+       */
+      type: 'abandoned';
+      query: Query;
+      rows: SearchResultRow[];
+      depth: number;
+      filtersTried: number;
+      unionSize: number;
     };
+
+/**
+ * A cover hook: the seam ISSUE-4b plugs into, invoked on a leaf that
+ * saturated and that the `PartitionChain` cannot narrow any further.
+ *
+ * Unlike a `PartitionStrategy`, a cover needs feedback from each response it
+ * gets back (to choose the next filter and to decide when its union has
+ * plateaued), which a synchronous `split(): Query[]` cannot express - that is
+ * why this is a separate seam rather than a fourth kind of chain link. It
+ * receives the `search` function directly so it can run its own probes, and
+ * the leaf's already-fetched first response so it does not have to repeat
+ * that request.
+ *
+ * Must end with exactly one `covered` or `abandoned` event; the walk does not
+ * yield an `unsplittable` for a leaf handed to a cover.
+ */
+export type CoverFn = (
+  leaf: Query,
+  first: SearchResponse,
+  search: SearchFn,
+) => AsyncGenerator<SweepEvent>;
 
 export interface SweepOptions {
   /** Root date range to walk, ISO 8601. */
   from: string;
   to: string;
-  search: (query: Query) => Promise<SearchResponse>;
+  search: SearchFn;
   chain: PartitionChain;
+  /**
+   * Optional hand-off for leaves the chain cannot split further (ISSUE-4b).
+   * When absent, such a leaf is emitted as `unsplittable`, unchanged from
+   * before this option existed.
+   */
+  cover?: CoverFn;
+  /** Dedup state across the run. Defaults to an in-memory `Set`. */
+  seen?: SeenSet;
 }
 
 /**
@@ -88,33 +170,21 @@ export interface SweepOptions {
  * its doc comment), not by this function.
  *
  * Deduplicates by CNJ number across the whole run, but only at **final**
- * events (`window` with `capped: false`, and `unsplittable` - see
+ * events (`window`, `unsplittable`, `covered`, `abandoned` - see
  * `SweepEvent`'s doc comment for why a capped window's rows must not be
  * registered as seen): different windows (in particular, class-split windows
  * over the same day) can surface the same case, and the acceptance criteria
  * call for one entry per case, not per window it appeared in.
  *
- * An async generator was chosen over an event callback for three reasons:
- *
- *   1. The walk is naturally recursive and depth-first; `yield*` delegation
- *      into recursive calls reads exactly like the tree it is describing,
- *      whereas a callback needs an explicit stack or continuation-passing to
- *      get the same shape.
- *   2. Backpressure is free: the generator does not run ahead of the consumer,
- *      which matters here because every yielded window has already spent a
- *      live HTTP request - a callback-based emitter would need its own pause
- *      mechanism to get the same throttling-friendly property.
- *   3. Testing is a plain `for await` collecting events into an array (see
- *      test/sweep.test.ts), with no fake event bus to wire up.
- *
- * The cost is that a consumer wanting fire-and-forget behavior must drive the
- * generator itself (`for await (const _ of sweep(...))`), but ISSUE-7's
- * resumable runner wants to persist after every event anyway, which a `for
- * await` loop does naturally.
+ * An async generator was chosen over an event callback: the walk is naturally
+ * recursive, so `yield*` delegation into child calls mirrors the tree it
+ * describes and gets free backpressure against the live HTTP throttle (each
+ * yielded window has already spent a request); see the issue resolution for
+ * the fuller comparison against a callback-based emitter.
  */
 export async function* sweep(options: SweepOptions): AsyncGenerator<SweepEvent> {
-  const { search, chain } = options;
-  const seen = new Set<string>();
+  const { search, chain, cover } = options;
+  const seen: SeenSet = options.seen ?? new Set<string>();
 
   yield* walk({ from: options.from, to: options.to }, 0);
 
@@ -123,14 +193,36 @@ export async function* sweep(options: SweepOptions): AsyncGenerator<SweepEvent> 
 
     if (!response.capped) {
       // Final event: dedupe against, and register into, the run-wide seen set.
-      yield { type: 'window', query, rows: deduplicate(response.rows, seen), capped: false, depth };
+      yield { type: 'window', query, rows: deduplicate(response.rows, seen), depth };
       return;
     }
 
     const strategy = chain.applicable(query);
     if (strategy === undefined) {
+      if (cover !== undefined) {
+        // The cover owns its own probing and union-growth logic; the walk's
+        // only responsibility is to apply the same run-wide dedup to
+        // whatever final rows it reports, exactly as for every other final
+        // event kind.
+        for await (const event of cover(query, response, search)) {
+          yield dedupeCoverEvent(event);
+        }
+        return;
+      }
       // Also final: this leaf's rows are the actual (incomplete-by-chain)
       // answer for it, so they must be deduplicated and registered too.
+      yield { type: 'unsplittable', query, rows: deduplicate(response.rows, seen), depth };
+      return;
+    }
+
+    // A strategy that says yes and produces nothing is, by definition, not
+    // actually splittable: computing subqueries BEFORE emitting the capped
+    // event lets an empty result fall through to `unsplittable` instead of
+    // silently dropping the leaf (e.g. JudicialClassSplit with an empty
+    // catalog, which is guarded against separately - see partition.ts - but
+    // this check is the walk's own backstop against any strategy doing this).
+    const subqueries = strategy.split(query);
+    if (subqueries.length === 0) {
       yield { type: 'unsplittable', query, rows: deduplicate(response.rows, seen), depth };
       return;
     }
@@ -140,22 +232,29 @@ export async function* sweep(options: SweepOptions): AsyncGenerator<SweepEvent> 
     // the children below. Registering them here would make those children's
     // genuine (final) sightings look like duplicates and drop them silently.
     yield {
-      type: 'window',
+      type: 'capped',
       query,
       rows: response.rows,
-      capped: true,
       depth,
       splitBy: strategy.name,
     };
 
-    for (const subquery of strategy.split(query)) {
+    for (const subquery of subqueries) {
       yield* walk(subquery, depth + 1);
     }
+  }
+
+  /** Deduplicates a cover's final rows the same way every other final event is. */
+  function dedupeCoverEvent(event: SweepEvent): SweepEvent {
+    if (event.type === 'covered' || event.type === 'abandoned') {
+      return { ...event, rows: deduplicate(event.rows, seen) };
+    }
+    return event;
   }
 }
 
 /** Keeps only rows whose CNJ number has not been yielded by an earlier final event. */
-function deduplicate(rows: SearchResultRow[], seen: Set<string>): SearchResultRow[] {
+function deduplicate(rows: SearchResultRow[], seen: SeenSet): SearchResultRow[] {
   const fresh: SearchResultRow[] = [];
   for (const row of rows) {
     if (seen.has(row.number)) continue;
