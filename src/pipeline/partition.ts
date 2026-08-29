@@ -24,9 +24,15 @@
  * That disjointness is what lets recursion terminate with completeness
  * *proved* rather than measured: once every leaf is uncapped, nothing has been
  * lost, because the leaves tile the original range without gaps or overlap.
- * ISSUE-4b's `PartyTokenSweep` is deliberately not like this - it is a cover,
- * not a partition - which is why it is documented as a separate kind of link in
- * the chain rather than folded in here.
+ *
+ * ISSUE-4b's `PartyTokenSweep` is deliberately **not** a `PartitionStrategy` and
+ * does not join this chain: it produces overlapping subqueries and needs
+ * feedback from each response to decide when to stop, neither of which a
+ * synchronous `split(query): Query[]` can express. It plugs into the sweep
+ * through a separate seam - the `cover` hook in `sweep.ts` - invoked exactly
+ * where this chain runs out. `PartitionStrategy` stays a two-member interface
+ * on purpose: it is the right shape for a provable partition, not a slot
+ * reserved for a third, structurally different kind of narrowing.
  */
 
 import type { JudicialClass, Query } from '../domain/types.js';
@@ -125,11 +131,31 @@ export class DateRangeSplit implements PartitionStrategy {
  * The catalog is fetched once by the caller (`PjeSearch.classCatalog()`) and
  * handed in here, so this strategy stays synchronous and side-effect free like
  * the rest of the chain.
+ *
+ * The constructor throws on an empty catalog. `canSplit` cannot see the
+ * catalog's size by itself - it would still return `true` for a single day
+ * with no class set, since that judgment only depends on the query - so an
+ * empty catalog would otherwise reach `split()` and there produce zero
+ * subqueries: the walk would emit the capped event for that day and then
+ * nothing further, silently dropping the whole leaf. `parseClassCatalog`
+ * itself has already returned an empty array once on a markup change without
+ * throwing (see its own doc comment), so this is not a hypothetical: failing
+ * in the constructor surfaces the problem immediately, at the point an
+ * operator is watching (catalog fetch, before any sweep starts), rather than
+ * as a silent gap discovered much later.
  */
 export class JudicialClassSplit implements PartitionStrategy {
   readonly name = 'judicial-class';
 
-  constructor(private readonly catalog: readonly JudicialClass[]) {}
+  constructor(private readonly catalog: readonly JudicialClass[]) {
+    if (catalog.length === 0) {
+      throw new RangeError(
+        'JudicialClassSplit built with an empty catalog: every single-day leaf ' +
+          'would be reported as splittable but produce no subqueries, silently ' +
+          'dropping it. Fetch the catalog again rather than proceeding.',
+      );
+    }
+  }
 
   canSplit(query: Query): boolean {
     return query.from === query.to && query.judicialClassId === undefined;
@@ -154,9 +180,12 @@ export class JudicialClassSplit implements PartitionStrategy {
  * Chain of partition strategies, tried in order.
  *
  * The chain itself carries no partitioning logic: it only picks the first
- * strategy that applies. That is what lets a third link (`PartyTokenSweep`,
- * ISSUE-4b) plug in later with zero changes here - it is appended to the list
- * passed to the constructor, nothing in this class needs to know it exists.
+ * strategy that applies, so a query can run out of one axis (date) and fall
+ * through to the next (judicial class) without an explicit `if`. It is
+ * closed over `PartitionStrategy` specifically - a provable, disjoint
+ * partition - not a general extension point: ISSUE-4b's `PartyTokenSweep`
+ * does not join this list. See the module comment above and `sweep.ts`'s
+ * `cover` hook for where that seam actually lives.
  */
 export class PartitionChain {
   constructor(private readonly strategies: readonly PartitionStrategy[]) {}

@@ -78,6 +78,15 @@ describe('JudicialClassSplit', () => {
   ];
   const strategy = new JudicialClassSplit(catalog);
 
+  it('refuses to be built with an empty catalog', () => {
+    // An empty catalog would let canSplit() keep saying "yes" for any single
+    // day with no class set, while split() produced zero subqueries - the
+    // walk would then emit the capped event and nothing else, silently
+    // dropping the whole leaf. Failing at construction surfaces this where an
+    // operator is watching (the catalog fetch, before any sweep starts).
+    expect(() => new JudicialClassSplit([])).toThrow(RangeError);
+  });
+
   it('is applicable only to a single day with no class set yet', () => {
     expect(strategy.canSplit({ from: '2025-03-11', to: '2025-03-11' })).toBe(true);
   });
@@ -108,8 +117,9 @@ describe('JudicialClassSplit', () => {
 });
 
 describe('PartitionChain', () => {
+  const catalog: JudicialClass[] = [{ id: '202', name: 'Agravo de Instrumento' }];
+
   it('picks the first strategy able to split the query', () => {
-    const catalog: JudicialClass[] = [{ id: '202', name: 'Agravo de Instrumento' }];
     const chain = new PartitionChain([new DateRangeSplit(), new JudicialClassSplit(catalog)]);
 
     expect(chain.applicable({ from: '2025-03-11', to: '2025-03-12' })?.name).toBe('date-range');
@@ -117,29 +127,30 @@ describe('PartitionChain', () => {
   });
 
   it('returns undefined when no link in the chain can split further', () => {
-    const chain = new PartitionChain([new DateRangeSplit(), new JudicialClassSplit([])]);
-    // Single day, class already set, empty catalog: nothing left to try.
+    const chain = new PartitionChain([new DateRangeSplit(), new JudicialClassSplit(catalog)]);
+    // Single day, class already set: date is exhausted and class was already applied.
     expect(
       chain.applicable({ from: '2025-03-11', to: '2025-03-11', judicialClassId: '202' }),
     ).toBeUndefined();
   });
 
-  it('accepts a third link without any change to its own code', () => {
-    // Stand-in for ISSUE-4b's PartyTokenSweep: the chain only needs the
-    // PartitionStrategy shape, so a fake with that shape plugs in unchanged.
-    const partyTokenStub = {
-      name: 'party-token',
+  it('picks a later link when the earlier ones are exhausted', () => {
+    // Not a claim that any arbitrary strategy can join this chain (see
+    // partition.ts's module comment: PartitionChain is closed over
+    // PartitionStrategy, a provable partition - ISSUE-4b's PartyTokenSweep is
+    // deliberately NOT one of these and plugs into sweep.ts's separate `cover`
+    // seam instead). This only checks that PartitionChain itself has no
+    // hardcoded notion of "two links": a third PartitionStrategy-shaped link
+    // is picked up like any other once the earlier links stop applying.
+    const laterLink = {
+      name: 'later-link',
       canSplit: (q: Query) => q.judicialClassId !== undefined,
       split: (q: Query) => [q],
     };
-    const chain = new PartitionChain([
-      new DateRangeSplit(),
-      new JudicialClassSplit([]),
-      partyTokenStub,
-    ]);
+    const chain = new PartitionChain([new DateRangeSplit(), new JudicialClassSplit(catalog), laterLink]);
 
     expect(
       chain.applicable({ from: '2025-03-11', to: '2025-03-11', judicialClassId: '202' })?.name,
-    ).toBe('party-token');
+    ).toBe('later-link');
   });
 });
