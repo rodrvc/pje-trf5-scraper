@@ -4,8 +4,6 @@ A TypeScript scraper for the
 [TRF5 PJe public case search](https://pjett.trf5.jus.br/pjeconsulta/ConsultaPublica/listView.seam),
 built on **plain HTTP requests**: no Puppeteer, Playwright or Selenium.
 
-> **Status: work in progress.** See the [issue board](issues/) for current state.
-
 ---
 
 ## About the documentation in this repository
@@ -57,58 +55,192 @@ scraper walks in ISSUE-5). It is not that paginators are beyond us — there sim
 is none on the results.
 
 **The solution** is to cover the corpus with many narrow queries instead of one broad
-one, splitting along two dimensions in cascade:
+one, splitting along three dimensions in cascade:
 
 1. **Filing date range (autuação)** — halve the range when it saturates
 2. **Judicial class** — when a single day still saturates
+3. **Party-name substring tokens** — when a single day + class leaf *still* saturates
 
 The second dimension proved essential: probing March 2025, **6 out of 13 days hit the
-cap on their own**. Full tables and details in `PROBLEMS.md` §5.
+cap on their own**. The third dimension is different in kind from the first two: date
+and class splits are disjoint partitions whose completeness is proved by construction
+(recursion stops when no half saturates), while "Nome da parte" is a `LIKE %token%`
+substring match, so filters *overlap* and the resulting subsets are a **cover, not a
+partition**. Completeness there is measured, not proved: a leaf is accepted once the
+union of cases found across filters stops growing for several filters in a row, and a
+leaf whose budget runs out before that point is recorded as incomplete rather than
+silently dropped. Full tables and details in `PROBLEMS.md` §5.
 
 ---
 
 ## Installation
 
+Requires Node.js 20 or newer.
+
 ```bash
 npm install
 ```
 
-Requires Node.js 20 or newer.
+## Quick start
 
-## Usage
+A short, bounded run against the real site:
 
 ```bash
-npm run scrape     # run the scraper
-npm test           # test suite (no network required)
-npm run typecheck  # type checking
+npm run scrape -- --from=2025-03-05 --to=2025-03-05
 ```
 
-> Detailed run instructions land with ISSUE-8.
+This prints the range and limits, one line per event as the run progresses, and a
+summary block at the end:
+
+```
+range: 2025-03-05..2025-03-05
+limits: maxRequests=40, maxCases=3, delayMs=1500, retryFailed=false
+09:14:02 search 2025-03-05 -> 10 rows
+09:14:04 case 0803807-42.2025.4.05.0000 detailed
+09:14:06 pdf 0803807-42.2025.4.05.0000 doc 123456 saved
+--- run summary ---
+windows: 1
+cases listed: 10
+cases detailed: 3
+cases failed: 0
+documents downloaded: 22
+documents skipped: 0
+documents failed: 0
+requests: 40
+429 retries: 0
+cases on disk: 3
+pending rows: 8
+retryable cases: 0
+retryable documents: 0
+stopped by: maxRequests
+```
+
+By default a run is **bounded**: `--max-requests` (default 40) and `--max-cases`
+(default 3) stop it well short of a full crawl, so it is safe to run repeatedly
+against the real court server. Pass `--unbounded` to remove both limits for a full
+crawl instead (use with care — this is a real court's production service).
+
+What lands on disk:
+
+- `data/*.ndjson` — one append-only file per record kind: `cases.ndjson` (one line
+  per scraped case), `pending.ndjson`/`dequeued.ndjson` (the listed-but-not-yet-
+  detailed queue), `sweep-progress.ndjson` (which search windows are already
+  covered), `failed-documents.ndjson` and `failed-cases.ndjson` (failure ledgers,
+  see below). Full schemas in [ISSUE-7](issues/ISSUE-7-persistence.md)'s Resolution.
+- `pdfs/<CNJ number>/<date>_<kind>_<documentId>.pdf` — one directory per case, one
+  file per document, named from the document's own date and kind so the files are
+  identifiable without opening them (`src/pje/pdf-naming.ts`).
+
+### Flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--from=YYYY-MM-DD` | yesterday, UTC | Start of the date range |
+| `--to=YYYY-MM-DD` | same as `--from` | End of the date range |
+| `--max-requests=N` | 40 | Stop after N network requests |
+| `--max-cases=N` | 3 | Stop after N cases detailed |
+| `--delay-ms=N` | 1500 | Minimum delay between requests (floor: 500) |
+| `--retry-failed` | off | Re-attempt previously failed cases/documents instead of a fresh sweep |
+| `--data-dir=PATH` | `data` | Where case/progress data is written |
+| `--pdf-dir=PATH` | `pdfs` | Where downloaded PDFs are written |
+| `--unbounded` | off | No request/case budget at all — a long-running full crawl |
+| `-h`, `--help` | — | Show usage and exit |
+
+## Resuming and retrying
+
+Re-running the same command is safe: `data/*.ndjson` is append-only and rebuilt into
+in-memory indexes at startup, so a resumed run skips search windows already recorded
+in `data/sweep-progress.ndjson` and skips cases already indexed in
+`data/cases.ndjson` — it does not re-search or re-detail what a previous run already
+covered, and `PjeDownloader` skips any PDF already valid on disk before re-downloading
+it.
+
+A case or document that failed is not retried automatically on the next plain run —
+it sits in `data/failed-cases.ndjson` / `data/failed-documents.ndjson` (latest record
+per case/document wins; a later success clears an earlier failure). Pass
+`--retry-failed` to make a run re-attempt exactly those, instead of sweeping a date
+range:
+
+```bash
+npm run scrape -- --retry-failed
+```
+
+## Rate limiting (429)
+
+A `429` response is detected on any request, retried with exponential backoff and
+jitter, honouring the server's `Retry-After` header when present. If retries are
+exhausted, the failing case or document is recorded in the relevant failure ledger
+and the run continues with the next one rather than stopping. If 429s keep arriving
+back to back, a circuit breaker trips and the run aborts cleanly, still printing the
+summary collected so far.
+
+No 429 was ever triggered against the real TRF5 server during development — this is
+demonstrated instead by tests against a simulated HTTP server (`test/client.test.ts`,
+`test/download.test.ts`, `test/backoff.test.ts`), covering a 429 with and without
+`Retry-After`, retry exhaustion, and the circuit breaker tripping and resetting.
+
+TRF5's PJe is a real court's public production service. The scraper uses
+**concurrency 1** and a configurable delay between requests (`--delay-ms`, floor
+500ms) on top of the 429 handling above, so a bounded demo run stays well behaved
+even before any rate limit is ever hit.
+
+## Plain HTTP, no browser
+
+The site is 2010s-era JSF/Seam with RichFaces: there is no API, only stateful form
+POSTs carrying a `javax.faces.ViewState` tied to a session cookie, the search itself
+is triggered by a hidden component (`fPP:j_id244`) rather than the visible button,
+and the page's reCAPTCHA is disabled server-side. Mixed encoding (UTF-8 on AJAX
+responses, ISO-8859-1 on page loads, with one query parameter that is latin-1 even
+inside a UTF-8 response) is handled by inspecting the raw bytes rather than trusting
+headers that never arrive. Details and evidence for each of these in
+[`PROBLEMS.md`](PROBLEMS.md) §1, §2, §3 and §8.
+
+## Sealed cases (segredo de justiça)
+
+The detail parser (`classifyDetailPage()` in `src/domain/parse-detail.ts`) only
+classifies a case as sealed when the page's own notice panel contains the site's
+wording ("segredo de justiça" / "autos sigilosos") — never from the mere absence of
+the usual case-data heading. A sealed case is stored with `sealed: true` and whatever
+partial data the page still shows.
+
+This is deliberately not the same code path as a broken response: a database error
+page or a dropped session also lacks the usual heading but carries none of that
+wording, and is classified `unexpected` instead, which the orchestrator retries or
+records as a failure rather than silently treating as a real sealed case. See
+`PROBLEMS.md` §6 for the live case that motivated the distinction.
+
+## Output format
+
+See [ISSUE-7](issues/ISSUE-7-persistence.md)'s Resolution for the full record
+schemas of every file under `data/`.
 
 ## Architecture
 
 Layers with dependencies flowing one way:
 
 ```
-src/http/      transport only: cookies, redirects, encoding, pacing, retries
-src/pje/       JSF protocol: session, ViewState, form POSTs
-src/domain/    types and pure parsers
-src/pipeline/  sweep orchestration
-src/cli/       flag parsing
+src/http/         transport only: cookies, redirects, encoding, pacing, retries
+src/pje/          JSF protocol: session, ViewState, form POSTs
+src/domain/       types and pure parsers
+src/pipeline/     sweep orchestration
+src/persistence/  append-only NDJSON stores and resume/retry state
+src/cli/          flags, progress lines, summary
 ```
 
 The transport layer knows nothing about JSF, and the parsers are pure
 `(html: string) => T` functions, which makes them testable without a network.
 
-## Consideration for the server
+## Tests
 
-TRF5's PJe is a real court's public production service. The scraper uses
-**concurrency 1** and a configurable delay between requests, and it aborts the run if
-consecutive 429s pile up rather than pressing on.
+```bash
+npm test           # 243 tests, offline
+npm run typecheck  # type checking
+```
 
-No 429 was ever triggered during the research. Rate-limit handling is implemented
-regardless — the brief requires it — and is demonstrated through **tests against a
-simulated server**, not by hammering the live site.
+Every test runs offline: parsers are tested as pure functions against real HTML
+fixtures captured from the site (`test/fixtures/`), and HTTP behaviour (429, retries,
+the circuit breaker) is tested against a simulated server via `nock`, never the live
+court.
 
 ## License
 
