@@ -34,8 +34,16 @@ Design it as an interchangeable strategy, not nested `if`s:
     }
 
 with `DateRangeSplit` and `JudicialClassSplit` here, chained so that when one
-runs out the next takes over. The chain must accept a third link without being
-rewritten: ISSUE-4b plugs `PartyTokenSweep` into it.
+runs out the next takes over.
+
+**Correction from an earlier draft of this section:** `PartyTokenSweep`
+(ISSUE-4b) does *not* join this chain as a third `PartitionStrategy`. It needs
+feedback from each response to choose its next filter and to decide when its
+union has plateaued, which a synchronous `split(query): Query[]` cannot
+express - and the sweep would have no way to tell a cover's children (which
+are not guaranteed complete on their own) from a partition's (which are, by
+construction). It plugs into `sweep()` through a separate seam, the `cover`
+hook, described below.
 
 Both strategies in this issue produce **disjoint** subqueries whose union is the
 parent by construction, so recursion terminates when none caps and completeness
@@ -68,8 +76,8 @@ indices, so there is no offset to exploit.
 - A broad range splits itself until no query caps.
 - A saturating day is split by judicial class rather than recorded as lost.
 - No cases are lost to silent truncation.
-- A day+class leaf that still saturates is handed to the next strategy in the
-  chain rather than silently accepted as complete (ISSUE-4b implements it).
+- A day+class leaf that still saturates is handed to the `cover` seam (ISSUE-4b
+  implements it) rather than silently accepted as complete.
 - Covered windows are recorded so runs can resume (ISSUE-7).
 
 ## Resolution
@@ -87,25 +95,29 @@ indices, so there is no offset to exploit.
   constructor. Applying the date axis first and the class axis only at a
   single day matches the issue's evidence: splitting a wide range by class
   would multiply requests for no benefit, since narrowing dates alone resolves
-  most saturation.
+  most saturation. The constructor throws on an empty catalog (see the
+  "empty split" correction below).
 - `PartitionChain` — an ordered list of strategies; `applicable(query)` returns
-  the first whose `canSplit` is true. The chain carries no partitioning logic
-  of its own, which is what lets ISSUE-4b's `PartyTokenSweep` plug in as a
-  third element of the array with zero changes to this file — verified with a
-  test (`test/partition.test.ts`, "accepts a third link without any change to
-  its own code") that appends a stub strategy and confirms the chain picks it
-  up.
+  the first whose `canSplit` is true. It is closed over `PartitionStrategy`
+  specifically - a provable, disjoint partition - **not** a general extension
+  point for any kind of narrowing; ISSUE-4b's `PartyTokenSweep` does not join
+  it (see the "hand-off seam" correction below). `test/partition.test.ts`,
+  "picks a later link when the earlier ones are exhausted", only checks that
+  the chain itself has no hardcoded notion of "two links" - not that any
+  strategy-shaped object is an appropriate thing to add to it.
 
 **`src/pipeline/sweep.ts`** — the walk itself: `sweep({ from, to, search,
-chain })`, an **async generator** yielding `SweepEvent`s (`'window'` for a
-completed window, capped or not; `'unsplittable'` for a leaf that saturated
-with nothing left in the chain to split it). Depth-first, so a short or
-interrupted run finishes a contiguous block of windows rather than a scattering
-of half-finished ones; recursion is expressed as `yield*` delegation into
-`walk(subquery, depth + 1)`, which reads as the same tree it describes.
-Deduplicates by CNJ number across the whole run via a `Set` closed over the
-walk, so a case surfacing in both a capped day-level window and one of its
-class-split children is only emitted once.
+chain, cover?, seen? })`, an **async generator** yielding `SweepEvent`s
+(`'window'` for a completed, uncapped window; `'capped'` for one that was
+narrowed further; `'unsplittable'` for a leaf with nothing left in the chain
+and no `cover` supplied; `'covered'`/`'abandoned'`, emitted only by a `cover`).
+Depth-first, so a short or interrupted run finishes a contiguous block of
+windows rather than a scattering of half-finished ones; recursion is expressed
+as `yield*` delegation into `walk(subquery, depth + 1)`, which reads as the
+same tree it describes. Deduplicates by CNJ number across the whole run
+through an injectable `SeenSet` (in-memory `Set` by default), so a case
+surfacing in both a capped day-level window and one of its class-split
+children is only emitted once.
 
 **Design choice: async generator over an event callback.** Three reasons,
 elaborated in the code comment: (1) the walk is naturally recursive, and
@@ -178,10 +190,140 @@ duplicates of the parent's. Also rewrote the pre-existing dedup test to
 dedupe only over final events, since counting a capped window's informational
 rows toward "the result" was the same category of mistake.
 
+### Correction: an empty `split()` result would silently drop a saturated leaf
+
+Caught in architecture review. `JudicialClassSplit.canSplit` returns `true` for
+any single day with no class set, regardless of the catalog's size - it has no
+way to see that the catalog is empty. If the catalog were ever empty (and
+`parseClassCatalog` has already once returned `[]` on a markup change without
+throwing - its own doc comment says so), `split()` would return `[]`: the walk
+would emit the `capped` event for that day and then iterate over zero
+subqueries, ending the branch with no further event at all. The leaf would
+vanish from the run with nothing to show for it - worse than `unsplittable`,
+which at least says "here is what was lost and why".
+
+Fixed at both layers, per the review's request:
+
+- `JudicialClassSplit`'s constructor now throws on an empty catalog, so the
+  problem surfaces at catalog-fetch time, where an operator is watching,
+  rather than silently during a sweep that may run unattended.
+- `sweep()`'s `walk` now computes `strategy.split(query)` into a local before
+  emitting anything; if that array is empty, it yields `unsplittable` directly
+  and never emits the `capped` event at all - a strategy that says yes and
+  produces nothing is, by definition, not actually splittable. This is a
+  backstop independent of the specific `JudicialClassSplit` guard, for any
+  future strategy that might make the same mistake.
+
+Tests: `test/partition.test.ts`, "refuses to be built with an empty catalog"
+(constructor throws); `test/sweep.test.ts`, "treats a strategy that applies
+but produces no subqueries as unsplittable, not as a dropped leaf" (a stub
+strategy with `canSplit: () => true, split: () => []` produces exactly one
+`unsplittable` event and no `capped` event, where the un-fixed code would have
+produced a `capped` event and then nothing).
+
+### Correction: the hand-off seam for ISSUE-4b is not the partition chain
+
+Also caught in architecture review, and the most significant structural change
+in this round. The original design (see the Scope correction above) proposed
+that `PartyTokenSweep` (ISSUE-4b) would join `PartitionChain` as a third
+`PartitionStrategy`. That does not work: a party-token cover needs the
+response from each filter it tries to decide the next filter and to know when
+its union has plateaued, and `PartitionStrategy.split(query): Query[]` is
+synchronous with no way to see those responses. Worse, the sweep would have
+treated every uncapped child the cover produced as an unconditionally final
+`window` event - which is wrong for a cover's children, since a cover's
+completeness is *measured*, not proved, and a leaf can be abandoned mid-way
+through its budget.
+
+`PartitionStrategy` and `PartitionChain` are unchanged in shape - they are the
+right abstraction for what they model, a provable partition - but every claim
+that a third link plugs into them was wrong and has been corrected: in
+`partition.ts`'s module comment and `PartitionChain`'s doc comment, in this
+issue's Scope, and in `issues/ISSUE-4b-party-sweep.md`'s Scope, which now
+describes the actual `cover` hook instead of a `PartitionStrategy`.
+`test/partition.test.ts`'s "accepts a third link without any change to its own
+code" test was renamed to "picks a later link when the earlier ones are
+exhausted" and its comment now says explicitly that this checks the chain has
+no hardcoded link count, not that any strategy-shaped object belongs in it.
+
+The real seam is a new, minimal hook on `sweep()`:
+
+    cover?: (leaf: Query, first: SearchResponse, search: SearchFn) => AsyncGenerator<SweepEvent>
+
+Invoked in `walk` exactly where `unsplittable` would otherwise be yielded,
+passed the leaf query, the response already fetched for it (so the cover does
+not repeat that request), and the `search` function to run its own probes.
+When `cover` is absent, behavior is byte-for-byte what it was before this
+option existed. Two new `SweepEvent` kinds exist for it: `covered` (`{ query,
+rows, depth, filtersTried, unionSize, plateaued: true }`, the union stopped
+growing) and `abandoned` (`{ query, rows, depth, filtersTried, unionSize }`,
+the per-leaf request budget ran out before plateau - never counted as
+complete). Both are **final** events for dedup purposes, exactly like `window`
+and `unsplittable`.
+
+Test: `test/sweep.test.ts`, "hands an unsplittable leaf to the injected cover
+instead of emitting unsplittable" (a fake cover wired in place of ISSUE-4b's
+real one proves the seam invokes correctly and that no `unsplittable` events
+occur once a cover is present) and "deduplicates a cover event rows against
+the run-wide seen set, like any other final event" (a row already seen by an
+earlier final event does not reappear in the cover's `covered` event).
+
+### N1: distinct event `type`s instead of a shared `'window'` + `capped` flag
+
+Also from review. `'window'` used to cover both the final, uncapped case and
+the informational, capped one, distinguished only by a `capped: boolean`
+field - which forced every test and any future consumer to narrow with a cast
+or a `capped` check before TypeScript would let them read the type-specific
+fields (`splitBy` only exists on the capped variant). Split into five
+distinct `type` values instead: `'window'` (final, uncapped), `'capped'`
+(informational, narrowed further), `'unsplittable'`, `'covered'`, `'abandoned'`
+- each a plain discriminated union member, no compound discriminant. All casts
+were removed from `test/sweep.test.ts` as part of this change.
+
+### N2: injectable `seen` set
+
+The `Set` backing dedup was hardcoded inside `sweep()`, which does not survive
+a process restart - exactly the case ISSUE-7 is built around. `SweepOptions`
+now accepts an optional `seen?: SeenSet` (`{ has(n), add(n) }`), defaulting to
+an in-memory `Set` when omitted, so ISSUE-7's runner can back it with
+persisted state instead. Noted in the doc comment: for `DateRangeSplit` and
+`JudicialClassSplit`, whose subqueries are disjoint by construction, dedup is
+a no-op in practice - it only starts doing real work once a `cover` (whose
+subqueries can genuinely overlap) is plugged in.
+
+### N4: `history-start.ts` had no tests
+
+Added `test/history-start.test.ts` (5 tests) with a scripted fake search
+parameterized by the year filings "start" in: exact boundary found by binary
+search, every probe recorded with its actual row count (the audit trail is
+independently checked, not just the final answer), `earliestPlausibleYear`
+honored as a hard floor even when it is wrong about the true start, the
+default 50-year floor applied when the option is omitted, and the edge case
+of filings starting in the current year itself.
+
+### An assumption worth stating outright: the class split's completeness rests on the catalog being complete
+
+`JudicialClassSplit` assumes the class catalog fetched via the autocomplete
+(`PjeSearch.classCatalog()`) is the **entire** set of judicial classes the
+court uses. If the autocomplete ever omitted a class - through a markup change,
+a server-side filter, or simply a class introduced after this catalog was
+fetched - cases filed under that missing class would never be reached by any
+subquery `JudicialClassSplit` produces, and the day would look completely
+covered (every emitted class-window uncapped) while silently missing an entire
+class's worth of cases. Nothing in this issue's code can detect that on its
+own: the catalog is trusted as given.
+
+This is why ISSUE-9's live run should include a cheap sanity check on at least
+one class-split day: `sum(rows across every emitted class-window for that day)
+>= 30` (the day's own capped count before the split). Agreement does not prove
+the catalog is complete, but disagreement would be strong evidence that it is
+not, and costs nothing beyond arithmetic already available in the event log.
+
 ### Verification
 
-`npm test`: **80 tests green** (57 pre-existing + 16 in `test/partition.test.ts`
-+ 7 in `test/sweep.test.ts`), no network. `npm run typecheck`: clean.
+`npm test`: **89 tests green** (57 pre-existing + 17 in `test/partition.test.ts`
++ 10 in `test/sweep.test.ts` + 5 in `test/history-start.test.ts`), no network.
+`npm run typecheck`: clean.
 
 ### Live smoke test
 
