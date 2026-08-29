@@ -205,7 +205,17 @@ Redone against the leaf PROBLEMS.md's original probe actually used and that
 this issue's own evidence rests on: **2025-03-12, day-level, no class
 filter** (30 rows, capped, warning present - see PROBLEMS.md §5's "third
 dimension" table). Ran live against the real `PjeSearch`/`JsfSession`/
-`HttpClient` stack (`delayMs: 1600`, no `sleep()` of the sweep's own):
+`HttpClient` stack (`delayMs: 1600`, no `sleep()` of the sweep's own).
+
+The same measurement is re-runnable without any TypeScript at all via
+`docs/probe-party-tokens.sh` (plain curl, in the style of
+`docs/probe-pagination.sh`/`docs/probe-class.sh`), which tracks the running
+union of CNJ numbers across a list of tokens and prints the same
+rows/capped/new/union columns as the table below. It requires **both** the
+class id and display name when a class filter is passed - the script's own
+comment repeats the "id alone is silently ignored" warning from the
+class-filter correction above, so a grader re-running it does not repeat
+that mistake.
 
 | # | Filter | Rows | Capped | New | Union |
 |---|--------|------|--------|-----|-------|
@@ -286,16 +296,110 @@ filter, which could trigger `covered` on a leaf that is not actually
 covered - the capped filter might be hiding cases beyond its own 30-row
 cutoff that a later, uncapped filter would have found.
 
-Fixed in `src/pipeline/party-sweep.ts`: the flat-streak counter is now only
-updated when `response.capped` is false; a capped filter's rows still get
-folded into the union (they are real, verified cases, so they can only help),
-but its silence neither starts nor extends the streak. Added
-`test/party-sweep.test.ts`, "does not let a capped filter satisfy the
+Fixed in `src/pipeline/party-sweep.ts`, first pass: the flat-streak counter
+was made to update only when `response.capped` is false; a capped filter's
+rows still get folded into the union (they are real, verified cases, so they
+can only help), but its silence would neither start nor extend the streak.
+Added `test/party-sweep.test.ts`, "does not let a capped filter satisfy the
 plateau, even when it adds nothing new" - two capped, flat filters in the
 middle of a run must not trigger `covered` with `plateauAfter: 2`; only two
 *uncapped* flat filters afterward do. This test fails under the pre-fix
 behavior (it would have plateaued three filters too early, at
 `filtersTried: 3` instead of `5`).
+
+### Correction: a capped filter that GROWS the union must still reset the streak
+
+Caught in architecture review of PR #11. The first pass's fix above went one
+step too far: it made a capped filter's outcome *never* touch the streak,
+growth included, when only its *silence* is untrustworthy. A capped filter
+that adds a genuinely new case is real, positive evidence the leaf still has
+more to give - there is nothing suspect about a positive result, only about
+a capped filter's lack of one - so failing to reset the streak on a capped-
+but-growing filter could let an earlier flat streak (from before the capped
+filter ran) carry through it and trigger a premature plateau. This is exactly
+the scenario the measured alphabet contains: `ER A` (position 11 of 15,
+before the reorder below) is capped and could sit in the middle of a longer
+run where streaks build.
+
+Fixed by reordering the check: growth always resets the streak, capped or
+not; only an *uncapped* filter's silence extends it.
+
+```ts
+if (grew) {
+  flatStreak = 0;
+} else if (!response.capped) {
+  flatStreak += 1;
+}
+```
+
+Added `test/party-sweep.test.ts`, "a capped filter that adds new cases still
+resets the streak" - a capped filter in the middle of a run that genuinely
+grows the union must reset an existing streak, proven by continuing with two
+more uncapped flat filters afterward and checking the plateau lands at
+`filtersTried: 4` (streak restarted at the capped grower), not one filter
+earlier (which is what the pre-fix, "capped never touches the streak"
+behavior would have produced).
+
+### Factory guards: reject configurations that can only ever produce `abandoned`
+
+Also from the same review round. Nothing previously stopped
+`createPartyTokenSweep({ plateauAfter: 0 })` (a "plateau" of zero consecutive
+flat filters is not a plateau) or a `maxFiltersPerLeaf` smaller than
+`plateauAfter` (the budget could never observe enough consecutive flat
+filters to reach a genuine plateau, so every leaf handed to it would
+silently end `abandoned` no matter what the server returned). Both are
+programming errors in how the cover is wired, not something a live run
+should discover only after burning its request budget.
+
+`createPartyTokenSweep` now throws `RangeError` synchronously, at
+construction, for either case. Added
+`test/party-sweep.test.ts`: "rejects a plateauAfter below 1" (0 and -1 both
+throw), "rejects a maxFiltersPerLeaf smaller than plateauAfter", and "accepts
+maxFiltersPerLeaf exactly equal to plateauAfter" (the boundary is inclusive -
+only strictly smaller is rejected). Also added an explicit
+"stops at maxFiltersPerLeaf even when the union is still growing and no
+plateau was reached" test, which existed only implicitly before (folded into
+other tests' assertions) and is now its own case: a leaf whose union never
+stops growing must still end `abandoned` once the budget runs out, with the
+alphabet's later tokens never even tried.
+
+Two pre-existing tests (`skips a token rejected by the server...`,
+`deduplicates the union across filters...`) used `plateauAfter: 5` against a
+3-token alphabet - a configuration the new guard now rejects outright.
+Adjusted both to `plateauAfter: 3`, matching the alphabet length; neither
+test's actual assertions depended on the specific threshold.
+
+### Doc fixes from the same review
+
+- `PartyTokenSweepOptions.maxFiltersPerLeaf`'s doc comment claimed it counts
+  the leaf's first (unfiltered) response; the code never did (that response
+  is already paid for by the walk before the cover runs, and only
+  `partyName` filters are counted). Fixed the comment and noted the budget
+  must be `>= plateauAfter`.
+- `createPartyTokenSweep`'s own doc comment now states its assumption that
+  the `first` response the walk hands it was itself capped - true by
+  construction of where `sweep()`'s `walk` invokes a `cover` (only after a
+  saturated leaf with no strategy left in the chain), but worth stating
+  explicitly since this module does not re-check it.
+- `party-token-alphabet.ts` claimed a capped filter's rows are "excluded ...
+  from the union tally" - wrong, and directly contradicted by the code: a
+  capped filter's rows are always merged into the union (they are real
+  cases), only its *silence* is excluded from counting as plateau evidence.
+  Corrected to say so plainly, and to match the corrected `grew`-first logic
+  above.
+
+### Alphabet order: known-capping tokens moved to the end
+
+`DE A` and `ER A` were the two tokens that came back capped in the
+measurement (positions 1 and 11 of 15). Per the same review, moved both to
+the end of `PARTY_TOKEN_ALPHABET` (now positions 14-15): a leaf should spend
+its cheaper, more informative uncapped tokens first, and only reach for the
+two whose *silence* carries no trust once those are exhausted, rather than
+risk a short-budget run finishing on two low-evidence requests near the
+front. This does not change the measured plateau point (46, unaffected by
+order for the underlying union growth), only where a request budget gets
+spent; `party-token-alphabet.ts`'s doc comment states the reordering and
+reasoning explicitly, next to the (unchanged) measurement table.
 
 ### An honest finding, corrected: 2025-03-12 (day-level) does saturate, and the party filter does escape the cap
 
@@ -312,35 +416,60 @@ corresponding correction.
 
 ### `data/uncoverable.ndjson`
 
-**`src/pipeline/uncoverable.ts`** — `recordUncoverable(record, path?)`, a
+**`src/pipeline/uncoverable.ts`** — `recordUncoverable(record, path)`, a
 small, focused writer: one JSON object per line (`query`, `depth`,
-`filtersTried`, `unionSize`, `rows`, `recordedAt`), append-only, creating the
-parent directory if missing. Deliberately minimal rather than a full
-persistence layer: ISSUE-7 (`todo` as of this branch) owns the general
-resuming story - state files, atomic writes, `--retry-failed` - and this
-module only commits to the file **format** the two issues need to coordinate
-on, an NDJSON record per abandoned leaf, so a caller can turn every
-`abandoned` `SweepEvent` into one call to `recordUncoverable` without
-inventing its own shape. `test/uncoverable.test.ts` covers the parent
+`filtersTried`, `unionSize`, an optional `cnjNumbers` list, `recordedAt`),
+append-only, creating the parent directory if missing. `path` is a required
+parameter, not defaulted to a path under `data/`: that directory's layout and
+lifecycle belong to ISSUE-7, not this module. `rows` (the full
+`SearchResultRow[]`) was dropped from the record per architecture review:
+an `abandoned` event's rows are already deduplicated output that ISSUE-7
+will persist as part of the run's normal output, so storing them a second
+time here would let the same cases be double-counted on a replay that reads
+both files; only the bare CNJ numbers are kept, optionally, as a lightweight
+cross-check. Deliberately minimal rather than a full persistence layer:
+ISSUE-7 (`todo` as of this branch) owns the general resuming story - state
+files, atomic writes, `--retry-failed` - and this module only commits to the
+file **format** the two issues need to coordinate on. It has no caller yet;
+`test/uncoverable.test.ts` exercises it directly and covers the parent
 directory being created on demand, one line per record with a valid ISO
-timestamp, and appending (not overwriting) across multiple abandoned leaves.
+timestamp, `cnjNumbers` being optional, and appending (not overwriting)
+across multiple abandoned leaves.
+
+### `docs/probe-party-tokens.sh`
+
+Added per architecture review, alongside `docs/probe-pagination.sh` and
+`docs/probe-class.sh`: a plain-curl re-run of the alphabet measurement above,
+so a grader can reproduce the union-vs-filters table without any TypeScript
+in the loop. Takes a date range, an optional class id/name pair, and a list
+of party-name tokens; tracks the running union of CNJ numbers exactly like
+the measurement table does. Deliberately requires **both** class fields when
+a class filter is passed - its own comment repeats the "id alone is silently
+ignored" warning from the class-filter correction above, so a grader
+re-running it does not repeat the mistake that produced this issue's first,
+wrong measurement pass. Smoke-tested live against 2025-03-12 (day-level and
+day+class-202) while writing it; output shape matches the shipped table.
 
 ### Verification
 
-`npm test`: **99 tests green** (89 pre-existing + 8 in `test/party-sweep.test.ts`
-+ 2 in `test/uncoverable.test.ts`, both `test/sweep.test.ts` cover-seam tests
-updated in place for the `CoverEvent` split), no network. `npm run typecheck`:
-clean.
+`npm test`: **105 tests green** (89 pre-existing + 13 in
+`test/party-sweep.test.ts` + 3 in `test/uncoverable.test.ts`, both
+`test/sweep.test.ts` cover-seam tests updated in place for the `CoverEvent`
+split), no network. `npm run typecheck`: clean.
 
 `test/party-sweep.test.ts` covers: plateau after N consecutive flat filters
 (`covered`, correct `filtersTried`/`unionSize`, and the token *after* the
 plateau is never even tried); a capped filter's silence not counting toward
-the plateau, even when it adds nothing new (the correction above); budget
-exhausted while still growing (`abandoned`); the first response's rows
-counted toward the union without a repeated request; a `RejectedQueryError`
-skipped rather than fatal (and still charged against the budget); any other
-error propagating instead of being swallowed; deduplication across
-overlapping filters; and a `sweep()` integration test proving a leaf
+the plateau even when it adds nothing new, and a capped filter that DOES grow
+the union still resetting the streak (the two corrections above); budget
+exhausted while still growing (`abandoned`); an explicit
+`maxFiltersPerLeaf` cutoff test independent of the plateau; the factory
+guards rejecting `plateauAfter < 1` and `maxFiltersPerLeaf < plateauAfter`
+(plus the inclusive boundary case); the first response's rows counted toward
+the union without a repeated request; a `RejectedQueryError` skipped rather
+than fatal (and still charged against the budget); any other error
+propagating instead of being swallowed; deduplication across overlapping
+filters; and a `sweep()` integration test proving a leaf
 `DateRangeSplit`/`JudicialClassSplit` cannot split any further reaches
 `covered` through the cover, never `unsplittable`.
 
