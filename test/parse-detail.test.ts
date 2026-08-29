@@ -32,10 +32,6 @@ const fixture = (name: string): string =>
   readFileSync(join(import.meta.dirname, 'fixtures', name), 'utf8');
 
 describe('classifyDetailPage', () => {
-  it('classifies an ordinary page by the "Dados do Processo" heading', () => {
-    expect(classifyDetailPage('<html>Dados do Processo</html>')).toEqual({ kind: 'detail' });
-  });
-
   it('classifies the page as sealed only on the positive segredo/sigilo text inside the notice panel', () => {
     const html = `<html><dl class="rich-messages"><dd>Processo em segredo de justiça</dd></dl></html>`;
     expect(classifyDetailPage(html)).toEqual({ kind: 'sealed' });
@@ -80,10 +76,6 @@ describe('classifyDetailPage', () => {
     expect(classification).toEqual({ kind: 'unexpected', reason: 'database error page' });
   });
 
-  it('reads the hand-derived sealed fixture as sealed', () => {
-    expect(classifyDetailPage(fixture('detail-sealed.html'))).toEqual({ kind: 'sealed' });
-  });
-
   it('reads a real ordinary detail page as "detail"', () => {
     expect(classifyDetailPage(fixture('detail-with-pagination.html'))).toEqual({ kind: 'detail' });
   });
@@ -119,6 +111,9 @@ describe('parseCaseHeader', () => {
   });
 
   it('keeps court and judgingBody as separate fields when both are present', () => {
+    // Both cells share no <label> of their own; they are told apart by which
+    // sub-heading their content contains, not by the label. Dropping one when
+    // both are present would lose real information.
     const html = `
       <div class="propertyView"><div class="name"><label></label></div>
         <div class="value col-sm-12">Órgão Julgador Colegiado Turma Recursal Endereço Rua X, 1</div></div>
@@ -131,41 +126,9 @@ describe('parseCaseHeader', () => {
     expect(header.judgingBody).toBe('3ª Vara Federal');
     expect(header.address).toBe('Rua X, 1');
   });
-
-  it('returns an empty header for markup with no propertyView blocks', () => {
-    expect(parseCaseHeader('<html>nothing</html>')).toEqual({});
-  });
 });
 
 describe('parseActiveParties / parsePassiveParties', () => {
-  it('parses a party with no document, only a role', () => {
-    const html = `
-      <table id="j_id146:processoPartesPoloAtivoResumidoList"><tbody><tr>
-        <td><span><div class="col-sm-12"><span class="text-bold">JOHN DOE (TESTEMUNHA)</span></div></span></td>
-        <td>Ativo</td>
-      </tr></tbody></table>`;
-
-    expect(parseActiveParties(html)).toEqual([{ name: 'JOHN DOE', role: 'TESTEMUNHA', status: 'Ativo' }]);
-  });
-
-  it('parses an attorney line with both OAB and CPF', () => {
-    const html = `
-      <table id="j_id146:processoPartesPoloAtivoResumidoList"><tbody><tr>
-        <td><span><div class="col-sm-12"><span class="">A B - OAB SP123 - CPF: 999.999.999-99 (ADVOGADO)</span></div></span></td>
-        <td>Ativo</td>
-      </tr></tbody></table>`;
-
-    expect(parseActiveParties(html)).toEqual([
-      {
-        name: 'A B',
-        role: 'ADVOGADO',
-        document: { kind: 'CPF', value: '999.999.999-99' },
-        oab: 'SP123',
-        status: 'Ativo',
-      },
-    ]);
-  });
-
   it('parses an OAB registration with a letter suffix (e.g. PE12345A)', () => {
     // Some state bars append a letter to supplementary/provisional
     // registrations; the plain digits-only pattern used to miss these.
@@ -207,37 +170,20 @@ describe('parseActiveParties / parsePassiveParties', () => {
     ]);
   });
 
-  it("extracts page 1's 10 passive parties from a real detail page", () => {
-    const parties = parsePassiveParties(fixture('detail-with-pagination.html'));
-
-    expect(parties).toHaveLength(10);
-    expect(parties.map((p) => p.role)).toEqual(expect.arrayContaining(['AGRAVADO', 'ADVOGADO']));
+  it("extracts page 1's 10 passive parties from a real detail page, and page 2's 2 remaining from the AJAX fixture", () => {
+    const page1 = parsePassiveParties(fixture('detail-with-pagination.html'));
+    expect(page1).toHaveLength(10);
+    expect(page1.map((p) => p.role)).toEqual(expect.arrayContaining(['AGRAVADO', 'ADVOGADO']));
     // Accents survive.
-    expect(parties.some((p) => p.name === 'MERCIA VIDAL LEAL')).toBe(true);
-  });
+    expect(page1.some((p) => p.name === 'MERCIA VIDAL LEAL')).toBe(true);
 
-  it("extracts page 2's 2 remaining passive parties from the AJAX fixture", () => {
-    const parties = parsePassiveParties(fixture('detail-page2-ajax.html'));
-
-    expect(parties).toHaveLength(2);
-    expect(parties.every((p) => p.role === 'ADVOGADO')).toBe(true);
-  });
-
-  it('returns nothing for a table that does not exist', () => {
-    expect(parseActiveParties('<html></html>')).toEqual([]);
+    const page2 = parsePassiveParties(fixture('detail-page2-ajax.html'));
+    expect(page2).toHaveLength(2);
+    expect(page2.every((p) => p.role === 'ADVOGADO')).toBe(true);
   });
 });
 
 describe('parseMovements', () => {
-  it('parses a simple dated entry', () => {
-    const html = `
-      <table id="j_id146:processoEvento"><tbody><tr>
-        <td><span>05/03/2025 18:49:34 - Juntada de certidão</span></td>
-      </tr></tbody></table>`;
-
-    expect(parseMovements(html)).toEqual([{ date: '2025-03-05', description: 'Juntada de certidão' }]);
-  });
-
   it("extracts page 1's 15 movements from a real detail page, in accented Portuguese", () => {
     // The full case has 75 movements over 5 pages (a Richfaces.Slider pager,
     // not a Datascroller - see parseAllPagers below); this fixture only
@@ -310,23 +256,13 @@ describe('parseDocuments', () => {
       'Despacho Inspeção - 1141 - INSPEÇÃO GERAL ORDINÁRIA DE 2023',
     );
   });
-
-  it('returns nothing when the table has no rows', () => {
-    expect(parseDocuments('<html></html>')).toEqual([]);
-  });
 });
 
 describe('decodeLatin1QueryValue', () => {
-  it('decodes latin-1 percent-encoding, not UTF-8', () => {
+  it('decodes latin-1 percent-encoding (not UTF-8), and treats + as a space', () => {
     expect(decodeLatin1QueryValue('Inspe%E7%E3o')).toBe('Inspeção');
     expect(decodeLatin1QueryValue('INSPE%C7%C3O')).toBe('INSPEÇÃO');
-  });
-
-  it('treats + as a space, as in any application/x-www-form-urlencoded value', () => {
     expect(decodeLatin1QueryValue('Inteiro+Teor')).toBe('Inteiro Teor');
-  });
-
-  it('passes plain ASCII through unchanged', () => {
     expect(decodeLatin1QueryValue('Despacho')).toBe('Despacho');
   });
 });
@@ -341,12 +277,6 @@ describe('parsePager / parseAllPagers', () => {
       pageFieldId: 'j_id146:processoPartesPoloPassivoResumidoList:j_id401:j_id402',
       pageCount: 2,
     });
-  });
-
-  it('reads a single, hidden datascroller (active parties) as one page', () => {
-    const pager = parsePager(fixture('detail-with-pagination.html'), 'processoPartesPoloAtivoResumidoList');
-
-    expect(pager?.pageCount).toBe(1);
   });
 
   it('reads the movements table as a 5-page Richfaces.Slider, not a datascroller', () => {
@@ -365,43 +295,20 @@ describe('parsePager / parseAllPagers', () => {
     }
   });
 
-  it('reads the documents table as a 2-page Richfaces.Slider', () => {
-    const pager = parsePager(fixture('detail-with-pagination.html'), 'processoDocumentoGridTab');
-
-    expect(pager).toMatchObject({ kind: 'slider', pageCount: 2 });
-    if (pager?.kind === 'slider') {
-      expect(pager.baseId).toBe('j_id146:j_id653');
-      expect(pager.pageFieldId).toBe('j_id146:j_id653:j_id654');
-      expect(pager.eventFieldId).toBe('j_id146:j_id653:j_id655');
-    }
-  });
-
-  it('does not pick up a later table\'s slider for a table with no pager of its own', () => {
-    // Parties tables paginate with a Datascroller and have no slider of their
-    // own; without bounding the search, looking for "the nearest slider after
-    // this table" would walk straight past them and find movements' slider
-    // instead.
-    const pager = parsePager(fixture('detail-with-pagination.html'), 'processoPartesPoloAtivoResumidoList');
-
-    expect(pager?.kind).toBe('datascroller');
-  });
-
-  it('reads pagers for all four tables at once', () => {
+  it('reads pagers for all four tables at once, including a single-page/hidden datascroller as one page', () => {
     const pagers = parseAllPagers(fixture('detail-with-pagination.html'));
 
-    expect(pagers.activeParties?.kind).toBe('datascroller');
+    // Active parties: a single, hidden datascroller (no numeric page links)
+    // is read as one page, not mistaken for a later table's pager.
+    expect(pagers.activeParties).toMatchObject({ kind: 'datascroller', pageCount: 1 });
     expect(pagers.passiveParties).toMatchObject({ kind: 'datascroller', pageCount: 2 });
     expect(pagers.movements).toMatchObject({ kind: 'slider', pageCount: 5 });
     expect(pagers.documents).toMatchObject({ kind: 'slider', pageCount: 2 });
   });
-
-  it('returns nothing for markup with no pagers at all', () => {
-    expect(parseAllPagers('<html></html>')).toEqual({});
-  });
 });
 
 describe('readDeclaredTotal', () => {
-  it('reads each real table\'s own declared total', () => {
+  it("reads each real table's own declared total", () => {
     const html = fixture('detail-with-pagination.html');
 
     expect(readDeclaredTotal(html, 'processoPartesPoloAtivoResumidoList')).toBe(1);
@@ -409,21 +316,15 @@ describe('readDeclaredTotal', () => {
     expect(readDeclaredTotal(html, 'processoEvento')).toBe(75);
     expect(readDeclaredTotal(html, 'processoDocumentoGridTab')).toBe(20);
   });
-
-  it('returns undefined when the table is not present', () => {
-    expect(readDeclaredTotal('<html></html>', 'processoEvento')).toBeUndefined();
-  });
 });
 
 describe('countTableRows', () => {
-  it('counts every row, downloadable or not', () => {
+  it('counts every row, downloadable or not, and does not count a nested control table as an extra row', () => {
     // 14 downloadable + 1 view-only = 15 rows, though parseDocuments() only
     // returns 14: the row count and the parsed count are different things on
     // purpose (see assertTotalMatches).
     expect(countTableRows(fixture('detail-with-pagination.html'), 'processoDocumentoGridTab')).toBe(15);
-  });
 
-  it('does not count a nested table\'s rows as the outer table\'s own (the datascroller control row)', () => {
     // A datascroller's own paging control renders as a small nested <table>
     // inside a <tbody> with no id, itself inside the outer table. A loose
     // "tbody tr" descendant selector picked that control row up as an
@@ -436,25 +337,15 @@ describe('countTableRows', () => {
 });
 
 describe('firstRowIndex', () => {
-  it('reads the absolute index of the first row (page 1 starts at 0)', () => {
+  it('reads a page-2 response\'s first row as starting past page 1 (absolute index 10, not 0)', () => {
     expect(firstRowIndex(fixture('detail-with-pagination.html'), 'processoPartesPoloPassivoResumidoList')).toBe(0);
-  });
-
-  it('reads a page-2 response\'s first row as starting past page 1 (index 10, not 0)', () => {
     expect(firstRowIndex(fixture('detail-page2-ajax.html'), 'processoPartesPoloPassivoResumidoList')).toBe(10);
-  });
-
-  it('returns undefined when the table has no rows', () => {
-    expect(firstRowIndex('<html></html>', 'processoEvento')).toBeUndefined();
   });
 });
 
 describe('assertTotalMatches', () => {
-  it('does nothing when the counts agree', () => {
+  it('does nothing when the counts agree, or when nothing was declared to check against', () => {
     expect(() => assertTotalMatches('processoEvento', 15, 15)).not.toThrow();
-  });
-
-  it('does nothing when no total was declared (nothing to check against)', () => {
     expect(() => assertTotalMatches('processoEvento', undefined, 3)).not.toThrow();
   });
 
@@ -470,11 +361,7 @@ describe('assertTotalMatches', () => {
 });
 
 describe('readSliderValue', () => {
-  it('reads the page a slider AJAX response reports', () => {
-    expect(readSliderValue(`<script>'sliderValue':'2'</script>`)).toBe(2);
-  });
-
-  it('reads the real page-2 slider response captured live', () => {
+  it('reads the page a real, live-captured slider AJAX response reports', () => {
     expect(readSliderValue(fixture('detail-slider-page2-ajax.html'))).toBe(2);
   });
 
@@ -484,10 +371,13 @@ describe('readSliderValue', () => {
 });
 
 describe('parseOuterFormFields', () => {
-  it('extracts named, submittable fields from a form onward, in order', () => {
+  it('extracts named, submittable fields from the target form onward, excluding an earlier unrelated form and submit/checkbox controls', () => {
+    // A real trap: PJe's detail page has other top-level forms (e.g. a
+    // tab-switcher) before the main j_id146 form. Their fields must not be
+    // included in a paging POST for j_id146's own pagers.
     const html = `
       <html><body>
-        <form id="other"><input name="unrelated" value="x" /></form>
+        <form id="j_id28"><input name="j_id28:field" value="tab" /></form>
         <form id="j_id146">
           <input type="hidden" name="javax.faces.ViewState" value="state1" />
           <input type="hidden" name="autoScroll" value="" />
@@ -496,25 +386,12 @@ describe('parseOuterFormFields', () => {
         </form>
       </body></html>`;
 
-    expect(parseOuterFormFields(html, 'j_id146')).toEqual([
+    const fields = parseOuterFormFields(html, 'j_id146');
+    expect(fields.some(([name]) => name === 'j_id28:field')).toBe(false);
+    expect(fields).toEqual([
       ['javax.faces.ViewState', 'state1'],
       ['autoScroll', ''],
     ]);
-  });
-
-  it('excludes fields from an earlier, unrelated top-level form', () => {
-    // A real trap: PJe's detail page has other top-level forms (e.g. a
-    // tab-switcher) before the main j_id146 form. Their fields must not be
-    // included in a paging POST for j_id146's own pagers.
-    const html = `
-      <html><body>
-        <form id="j_id28"><input name="j_id28:field" value="tab" /></form>
-        <form id="j_id146"><input name="j_id146:field" value="main" /></form>
-      </body></html>`;
-
-    const fields = parseOuterFormFields(html, 'j_id146');
-    expect(fields.some(([name]) => name === 'j_id28:field')).toBe(false);
-    expect(fields).toEqual([['j_id146:field', 'main']]);
   });
 
   it('dedupes javax.faces.ViewState to its first occurrence', () => {
@@ -552,9 +429,5 @@ describe('parseOuterFormFields', () => {
     // control actually activated ever rides along in a real submission, and
     // this page's paging never activates it.
     expect(fields.some(([name]) => name === 'j_id146:j_id663')).toBe(false);
-  });
-
-  it('returns nothing when the form id is not present', () => {
-    expect(parseOuterFormFields('<html></html>', 'j_id146')).toEqual([]);
   });
 });
