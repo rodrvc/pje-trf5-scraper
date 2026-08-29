@@ -20,9 +20,11 @@ import {
   parseCaseHeader,
   parseDocuments,
   parseMovements,
+  parseOuterFormFields,
   parsePassiveParties,
   parsePager,
   readDeclaredTotal,
+  readSliderValue,
 } from '../src/domain/parse-detail.js';
 import { ParseError } from '../src/domain/errors.js';
 
@@ -420,6 +422,17 @@ describe('countTableRows', () => {
     // purpose (see assertTotalMatches).
     expect(countTableRows(fixture('detail-with-pagination.html'), 'processoDocumentoGridTab')).toBe(15);
   });
+
+  it('does not count a nested table\'s rows as the outer table\'s own (the datascroller control row)', () => {
+    // A datascroller's own paging control renders as a small nested <table>
+    // inside a <tbody> with no id, itself inside the outer table. A loose
+    // "tbody tr" descendant selector picked that control row up as an
+    // 11th row of a 10-row passive-parties page, which shrank the inferred
+    // page size and made every later page's index look wrong.
+    expect(
+      countTableRows(fixture('detail-with-pagination.html'), 'processoPartesPoloPassivoResumidoList'),
+    ).toBe(10);
+  });
 });
 
 describe('firstRowIndex', () => {
@@ -453,5 +466,95 @@ describe('assertTotalMatches', () => {
 
   it('throws ParseError when the collected count exceeds the declared total (duplicates)', () => {
     expect(() => assertTotalMatches('processoEvento', 12, 22)).toThrow(ParseError);
+  });
+});
+
+describe('readSliderValue', () => {
+  it('reads the page a slider AJAX response reports', () => {
+    expect(readSliderValue(`<script>'sliderValue':'2'</script>`)).toBe(2);
+  });
+
+  it('reads the real page-2 slider response captured live', () => {
+    expect(readSliderValue(fixture('detail-slider-page2-ajax.html'))).toBe(2);
+  });
+
+  it('returns undefined when there is no sliderValue at all', () => {
+    expect(readSliderValue('<html></html>')).toBeUndefined();
+  });
+});
+
+describe('parseOuterFormFields', () => {
+  it('extracts named, submittable fields from a form onward, in order', () => {
+    const html = `
+      <html><body>
+        <form id="other"><input name="unrelated" value="x" /></form>
+        <form id="j_id146">
+          <input type="hidden" name="javax.faces.ViewState" value="state1" />
+          <input type="hidden" name="autoScroll" value="" />
+          <input type="submit" name="ignoredSubmit" value="Go" />
+          <input type="checkbox" name="ignoredCheckbox" value="on" />
+        </form>
+      </body></html>`;
+
+    expect(parseOuterFormFields(html, 'j_id146')).toEqual([
+      ['javax.faces.ViewState', 'state1'],
+      ['autoScroll', ''],
+    ]);
+  });
+
+  it('excludes fields from an earlier, unrelated top-level form', () => {
+    // A real trap: PJe's detail page has other top-level forms (e.g. a
+    // tab-switcher) before the main j_id146 form. Their fields must not be
+    // included in a paging POST for j_id146's own pagers.
+    const html = `
+      <html><body>
+        <form id="j_id28"><input name="j_id28:field" value="tab" /></form>
+        <form id="j_id146"><input name="j_id146:field" value="main" /></form>
+      </body></html>`;
+
+    const fields = parseOuterFormFields(html, 'j_id146');
+    expect(fields.some(([name]) => name === 'j_id28:field')).toBe(false);
+    expect(fields).toEqual([['j_id146:field', 'main']]);
+  });
+
+  it('dedupes javax.faces.ViewState to its first occurrence', () => {
+    // PJe's markup nests <form> elements (HTML-invalid); every visually
+    // "nested" one carries its own copy of the same ViewState value. A real
+    // form submission has exactly one ViewState field.
+    const html = `
+      <html><body>
+        <form id="j_id146">
+          <input type="hidden" name="javax.faces.ViewState" value="state1" />
+          <input type="hidden" name="j_id146:x" value="1" />
+          <input type="hidden" name="javax.faces.ViewState" value="state1" />
+        </form>
+      </body></html>`;
+
+    expect(parseOuterFormFields(html, 'j_id146')).toEqual([
+      ['javax.faces.ViewState', 'state1'],
+      ['j_id146:x', '1'],
+    ]);
+  });
+
+  it('matches the real, live-captured field set exactly (name and value, in order)', () => {
+    // The strongest test available: a real form of 76 <input> elements (one
+    // button excluded, 16 duplicate ViewState fields deduped to 1) - captured
+    // live, compared field-for-field against the exact POST body the client
+    // sent and the server accepted (see PROBLEMS.md §6).
+    const fields = parseOuterFormFields(fixture('detail-slider-page1.html'), 'j_id146');
+
+    expect(fields).toHaveLength(60);
+    expect(fields.find(([name]) => name === 'j_id146:j_id561:j_id562')).toEqual([
+      'j_id146:j_id561:j_id562',
+      '1',
+    ]);
+    // The one button on the page (a "Print" action) is excluded: only the
+    // control actually activated ever rides along in a real submission, and
+    // this page's paging never activates it.
+    expect(fields.some(([name]) => name === 'j_id146:j_id663')).toBe(false);
+  });
+
+  it('returns nothing when the form id is not present', () => {
+    expect(parseOuterFormFields('<html></html>', 'j_id146')).toEqual([]);
   });
 });

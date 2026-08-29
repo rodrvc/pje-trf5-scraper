@@ -332,7 +332,7 @@ function parseParties(html: string, tableIdSuffix: string): Party[] {
   const $ = cheerio.load(html);
   const parties: Party[] = [];
 
-  $(`table[id$="${tableIdSuffix}"] tbody tr`).each((_, row) => {
+  $(`table[id$="${tableIdSuffix}"] > tbody > tr`).each((_, row) => {
     const $row = $(row);
     const cells = $row.find('td');
     if (cells.length < 2) return;
@@ -366,7 +366,7 @@ export function parseMovements(html: string): Movement[] {
   const $ = cheerio.load(html);
   const movements: Movement[] = [];
 
-  $(`table[id$="${TABLE_ID.movements}"] tbody tr`).each((_, row) => {
+  $(`table[id$="${TABLE_ID.movements}"] > tbody > tr`).each((_, row) => {
     const text = squash($(row).find('td').first().text());
     const match = RE_DATED_ENTRY.exec(text);
     if (match === null) return;
@@ -395,7 +395,7 @@ export function parseDocuments(html: string): CaseDocument[] {
   const $ = cheerio.load(html);
   const documents: CaseDocument[] = [];
 
-  $(`table[id$="${TABLE_ID.documents}"] tbody tr`).each((_, row) => {
+  $(`table[id$="${TABLE_ID.documents}"] > tbody > tr`).each((_, row) => {
     const $row = $(row);
     const link = $row.find('a[href*="idBin="]').first();
     if (link.length === 0) return;
@@ -460,10 +460,16 @@ export function parseDocuments(html: string): CaseDocument[] {
  * Used to cross-check against the "N resultados encontrados" total the page
  * itself declares (see `readDeclaredTotal`): a row count is not the same
  * thing as `parseDocuments().length`, which already dropped view-only rows.
+ *
+ * Direct `> tbody > tr` child, not a loose descendant selector: a
+ * datascroller's own paging control renders as a small nested `<table>`
+ * (its own `<tbody>` has no id) inside the outer table, and a bare
+ * `tbody tr` selector silently counted that control row as an extra row of
+ * the outer table too.
  */
 export function countTableRows(html: string, tableIdSuffix: string): number {
   const $ = cheerio.load(html);
-  return $(`table[id$="${tableIdSuffix}"] tbody tr`).length;
+  return $(`table[id$="${tableIdSuffix}"] > tbody > tr`).length;
 }
 
 /**
@@ -679,4 +685,93 @@ export function assertTotalMatches(
       tableIdSuffix,
     );
   }
+}
+
+/**
+ * Reads the `sliderValue` a slider's AJAX paging response reports, e.g. `2`
+ * from `'sliderValue':'2'`.
+ *
+ * Unlike a datascroller page, a slider page's rows are **re-indexed from 0**
+ * on every page (page 2 of a 15-per-page table is rows `0..N`, not `15..N`;
+ * confirmed live, see PROBLEMS.md §6). `firstRowIndex()` therefore cannot
+ * confirm a slider paging POST actually advanced - this is the equivalent
+ * check for that widget: the response itself echoes which page it rendered.
+ */
+export function readSliderValue(html: string): number | undefined {
+  const match = /'sliderValue'\s*:\s*'(\d+)'/.exec(html);
+  return match !== null ? Number.parseInt(match[1] as string, 10) : undefined;
+}
+
+/**
+ * A field name/value pair from a submittable `<input>`.
+ */
+export type FormField = readonly [name: string, value: string];
+
+/**
+ * Input `type`s a real browser never includes in a form submission unless
+ * that specific control was the one activated - never true for a page we
+ * are replaying wholesale.
+ */
+const NON_SUBMITTED_INPUT_TYPES = new Set(['submit', 'button', 'image', 'checkbox', 'radio']);
+
+/**
+ * Extracts every submittable, named `<input>` field from one form onward, in
+ * document order - the fields a real form submission of that form would
+ * carry.
+ *
+ * **Why "from the form onward" rather than "inside the form":** PJe nests
+ * `<form>` elements (a scroller's or slider's own pager sits in a `<form>`
+ * that is itself inside the page's main `j_id146` form). HTML forbids nested
+ * forms; when a real browser parses this markup it silently drops the inner
+ * `<form>` open tag and its matching `</form>`, so every "nested" field ends
+ * up belonging to the *outer* form's DOM, not a form of its own. A
+ * `Richfaces.Slider`'s `A4J.AJAX.Submit('j_id146:j_id561', ...)` therefore
+ * does not submit some small six-field sub-form; it submits the **entire**
+ * `j_id146` form, all ~75 fields of it. Posting only the inner pager's own
+ * fields (the first attempt at this) is accepted by the server with a 200,
+ * but renders nothing (`Ajax-Update-Ids content=""`): confirmed live, see
+ * PROBLEMS.md §6.
+ *
+ * `javax.faces.ViewState` appears once per (HTML-invalid) nested form in the
+ * markup, always with the same value; only its first occurrence is kept, one
+ * of the few places this function does more than "read what's there in
+ * order" - a real submitted form has exactly one ViewState field, not one
+ * per visually-nested widget.
+ *
+ * Cheerio (built on parse5) corrects the invalid nesting the same way a
+ * browser does, so a plain `input[name]` selector already returns the right,
+ * flattened set; the only extra step is starting the parse from the target
+ * form's own opening tag (there can be *other*, unrelated top-level forms
+ * earlier in the document, e.g. a tab-switcher form, whose fields must not
+ * be included).
+ */
+export function parseOuterFormFields(html: string, formId: string): FormField[] {
+  const marker = `id="${formId}"`;
+  const idIndex = html.indexOf(marker);
+  if (idIndex === -1) return [];
+
+  const formStart = html.lastIndexOf('<form', idIndex);
+  if (formStart === -1) return [];
+
+  const $ = cheerio.load(html.slice(formStart));
+  const fields: FormField[] = [];
+  let seenViewState = false;
+
+  $('input[name]').each((_, element) => {
+    const $el = $(element);
+    const type = ($el.attr('type') ?? 'text').toLowerCase();
+    if (NON_SUBMITTED_INPUT_TYPES.has(type)) return;
+
+    const name = $el.attr('name') ?? '';
+    if (name === '') return;
+
+    if (name === 'javax.faces.ViewState') {
+      if (seenViewState) return;
+      seenViewState = true;
+    }
+
+    fields.push([name, $el.attr('value') ?? '']);
+  });
+
+  return fields;
 }
