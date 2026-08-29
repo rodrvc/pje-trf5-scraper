@@ -40,11 +40,13 @@ export interface PartyTokenSweepOptions {
    */
   plateauAfter?: number;
   /**
-   * Maximum number of filters to try on one leaf, counting the first
-   * (unfiltered) response already supplied by the walk. Guards a leaf that
-   * keeps growing slowly from consuming the alphabet unboundedly against a
-   * live server. Default matches the alphabet's own length, i.e. "try the
-   * whole alphabet at most once".
+   * Maximum number of `partyName` filters to try on one leaf. Does **not**
+   * count the leaf's own first (unfiltered) response - that one is already
+   * paid for by the walk before the cover ever runs, so it costs nothing
+   * further to fold in. Guards a leaf that keeps growing slowly from
+   * consuming the alphabet unboundedly against a live server. Default
+   * matches the alphabet's own length, i.e. "try the whole alphabet at most
+   * once". Must be at least `plateauAfter` - see the factory's guard.
    */
   maxFiltersPerLeaf?: number;
 }
@@ -59,11 +61,33 @@ const DEFAULT_PLATEAU_AFTER = 5;
  * across every leaf it is invoked on - the per-leaf state (the union map,
  * the plateau counter) lives inside the generator's own closure per
  * invocation, not on `this`.
+ *
+ * Assumes the `first` response the walk hands it was itself capped - that is
+ * the only reason `sweep()`'s `walk` ever reaches the point where a `cover`
+ * is invoked (see `sweep.ts`: the cover seam sits exactly where an
+ * `unsplittable` event would otherwise be yielded, which only happens after
+ * `response.capped` was true and the chain ran out of strategies). This
+ * function does not re-check that assumption itself.
  */
 export function createPartyTokenSweep(options: PartyTokenSweepOptions = {}): CoverFn {
   const alphabet = options.alphabet ?? PARTY_TOKEN_ALPHABET;
   const plateauAfter = options.plateauAfter ?? DEFAULT_PLATEAU_AFTER;
   const maxFiltersPerLeaf = options.maxFiltersPerLeaf ?? alphabet.length;
+
+  if (plateauAfter < 1) {
+    throw new RangeError(
+      `plateauAfter must be at least 1, got ${plateauAfter}: a plateau of zero ` +
+        'consecutive flat filters is not a plateau at all.',
+    );
+  }
+  if (maxFiltersPerLeaf < plateauAfter) {
+    throw new RangeError(
+      `maxFiltersPerLeaf (${maxFiltersPerLeaf}) must be at least plateauAfter ` +
+        `(${plateauAfter}): a smaller budget could never observe enough ` +
+        'consecutive flat filters to reach a genuine plateau, which would ' +
+        'silently guarantee every leaf ends abandoned.',
+    );
+  }
 
   return async function* partyTokenSweep(
     leaf: Query,
@@ -104,17 +128,19 @@ export function createPartyTokenSweep(options: PartyTokenSweepOptions = {}): Cov
       for (const row of response.rows) union.set(row.number, row);
       const grew = union.size > sizeBefore;
 
-      // A filter that is itself capped is untrustworthy as a "no new cases"
+      // A capped filter's SILENCE is untrustworthy as a "no new cases"
       // signal: its own rows are truncated at the site's 30-row limit, so it
-      // may be hiding cases beyond what it reported, whether or not it added
-      // anything to the union this time. Its rows still get folded into the
-      // union above (they are still real, verified cases), but it must not
-      // count toward - or reset - the flat streak either way, the same
-      // distrust already applied when comparing alphabets (see
-      // party-token-alphabet.ts): only an uncapped filter's silence is
-      // evidence the plateau is real.
-      if (!response.capped) {
-        flatStreak = grew ? 0 : flatStreak + 1;
+      // may be hiding cases beyond what it reported. But a capped filter that
+      // DID grow the union is still real, verified evidence that the leaf has
+      // more to give - there is nothing untrustworthy about a positive
+      // result, only about a capped filter's lack of one. So growth always
+      // resets the streak, capped or not; only an uncapped filter's silence
+      // extends it (see party-token-alphabet.ts for the same distrust
+      // applied when comparing alphabets).
+      if (grew) {
+        flatStreak = 0;
+      } else if (!response.capped) {
+        flatStreak += 1;
       }
 
       if (flatStreak >= plateauAfter) {

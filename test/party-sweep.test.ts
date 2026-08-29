@@ -114,6 +114,8 @@ describe('createPartyTokenSweep', () => {
   it('reports abandoned when the budget runs out while the union is still growing', async () => {
     // Every filter keeps adding a new case, so the plateau condition never
     // fires; the alphabet (acting as the budget here) runs out first.
+    // plateauAfter must be <= the alphabet length (the factory guard rejects
+    // otherwise - see the dedicated guard tests below), so this uses 3.
     const alphabet = ['T1', 'T2', 'T3'];
     let counter = 0;
     const search = async (): Promise<SearchResponse> => {
@@ -121,7 +123,7 @@ describe('createPartyTokenSweep', () => {
       return response([row(`case-${counter}`)]);
     };
 
-    const cover = createPartyTokenSweep({ alphabet, plateauAfter: 5 });
+    const cover = createPartyTokenSweep({ alphabet, plateauAfter: 3 });
     const events = [];
     for await (const event of cover(leaf, response([]), search)) events.push(event);
 
@@ -131,6 +133,59 @@ describe('createPartyTokenSweep', () => {
       expect(events[0].filtersTried).toBe(3);
       expect(events[0].unionSize).toBe(3);
     }
+  });
+
+  it('a capped filter that adds new cases still resets the streak', async () => {
+    // Mirrors the capped-silence test above, but for the opposite case: T1
+    // starts a flat streak (uncapped, adds nothing new relative to the
+    // seed), T2 is CAPPED but genuinely grows the union - that growth is
+    // real, verified evidence and must reset the streak just like an
+    // uncapped grower would, even though T2's own silence (had it had any)
+    // would not have been trusted. T3/T4 are uncapped and flat, completing
+    // the plateau at exactly 2 - proving the streak restarted at T2 rather
+    // than continuing from T1.
+    const alphabet = ['T1', 'T2', 'T3', 'T4', 'T5'];
+    const search = async (query: Query): Promise<SearchResponse> => {
+      switch (query.partyName) {
+        case 'T1':
+          // Uncapped, flat against the seed: starts a streak of 1.
+          return response([row('seed')]);
+        case 'T2':
+          // Capped, but adds a genuinely new case: must reset the streak to 0.
+          return response([row('seed'), row('new-from-capped')], true);
+        case 'T3':
+          // Uncapped, flat: streak = 1 (restarted after T2, not continuing
+          // from T1's streak of 1 - a buggy implementation that never resets
+          // on a capped-but-growing filter would already be at streak 2 here
+          // and plateau one filter too early).
+          return response([row('seed')]);
+        case 'T4':
+          // Uncapped, flat: streak = 2, plateau reached here.
+          return response([row('seed')]);
+        default:
+          // T5 must never be tried.
+          return response([row('z')]);
+      }
+    };
+
+    const calls: string[] = [];
+    const wrappedSearch = async (query: Query): Promise<SearchResponse> => {
+      calls.push(query.partyName ?? '');
+      return search(query);
+    };
+
+    const first = response([row('seed')]);
+    const cover = createPartyTokenSweep({ alphabet, plateauAfter: 2 });
+    const events = [];
+    for await (const event of cover(leaf, first, wrappedSearch)) events.push(event);
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.type).toBe('covered');
+    if (events[0]?.type === 'covered') {
+      expect(events[0].filtersTried).toBe(4);
+      expect(events[0].rows.map((r) => r.number).sort()).toEqual(['new-from-capped', 'seed']);
+    }
+    expect(calls).toEqual(['T1', 'T2', 'T3', 'T4']);
   });
 
   it('counts rows from the first (already-fetched) response toward the union', async () => {
@@ -162,7 +217,9 @@ describe('createPartyTokenSweep', () => {
       return response([row('y')]);
     };
 
-    const cover = createPartyTokenSweep({ alphabet, plateauAfter: 5 });
+    // plateauAfter must be <= the alphabet length (3 here) or the factory
+    // guard rejects it - see the dedicated guard tests below.
+    const cover = createPartyTokenSweep({ alphabet, plateauAfter: 3 });
     const events = [];
     for await (const event of cover(leaf, response([]), search)) events.push(event);
 
@@ -189,6 +246,59 @@ describe('createPartyTokenSweep', () => {
     await expect(iterator.next()).rejects.toThrow('network exploded');
   });
 
+  it('stops at maxFiltersPerLeaf even when the union is still growing and no plateau was reached', async () => {
+    // Every filter keeps growing the union (never triggers plateauAfter),
+    // but maxFiltersPerLeaf caps the run at 2 filters out of a 5-token
+    // alphabet - the budget, not the plateau, must be what ends this leaf.
+    const alphabet = ['T1', 'T2', 'T3', 'T4', 'T5'];
+    let counter = 0;
+    const search = async (): Promise<SearchResponse> => {
+      counter += 1;
+      return response([row(`case-${counter}`)]);
+    };
+
+    const calls: string[] = [];
+    const wrappedSearch = async (query: Query): Promise<SearchResponse> => {
+      calls.push(query.partyName ?? '');
+      return search();
+    };
+
+    const cover = createPartyTokenSweep({ alphabet, plateauAfter: 2, maxFiltersPerLeaf: 2 });
+    const events = [];
+    for await (const event of cover(leaf, response([]), wrappedSearch)) events.push(event);
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.type).toBe('abandoned');
+    if (events[0]?.type === 'abandoned') {
+      expect(events[0].filtersTried).toBe(2);
+      expect(events[0].unionSize).toBe(2);
+    }
+    // Only T1 and T2 ran: T3-T5 were never reached once the budget was hit.
+    expect(calls).toEqual(['T1', 'T2']);
+  });
+
+  it('rejects a plateauAfter below 1', () => {
+    expect(() => createPartyTokenSweep({ plateauAfter: 0 })).toThrow(RangeError);
+    expect(() => createPartyTokenSweep({ plateauAfter: -1 })).toThrow(RangeError);
+  });
+
+  it('rejects a maxFiltersPerLeaf smaller than plateauAfter', () => {
+    // A budget smaller than the plateau threshold could never observe enough
+    // consecutive flat filters to plateau, which would silently guarantee
+    // every leaf ends abandoned - this must fail loudly instead, at
+    // construction time.
+    expect(() =>
+      createPartyTokenSweep({ alphabet: ['T1', 'T2'], plateauAfter: 3, maxFiltersPerLeaf: 2 }),
+    ).toThrow(RangeError);
+  });
+
+  it('accepts maxFiltersPerLeaf exactly equal to plateauAfter', () => {
+    // The boundary case: equal is allowed, only strictly smaller is rejected.
+    expect(() =>
+      createPartyTokenSweep({ alphabet: ['T1', 'T2'], plateauAfter: 2, maxFiltersPerLeaf: 2 }),
+    ).not.toThrow();
+  });
+
   it('deduplicates the union across filters, including cases seen by more than one token', async () => {
     const alphabet = ['T1', 'T2', 'T3'];
     const search = async (query: Query): Promise<SearchResponse> => {
@@ -197,7 +307,9 @@ describe('createPartyTokenSweep', () => {
       return response([row('c'), row('d')]); // 'c' overlaps
     };
 
-    const cover = createPartyTokenSweep({ alphabet, plateauAfter: 5 });
+    // plateauAfter must be <= the alphabet length (3 here) or the factory
+    // guard rejects it - see the dedicated guard tests below.
+    const cover = createPartyTokenSweep({ alphabet, plateauAfter: 3 });
     const events = [];
     for await (const event of cover(leaf, response([]), search)) events.push(event);
 
